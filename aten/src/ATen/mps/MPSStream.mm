@@ -71,6 +71,9 @@ id<MTLComputeCommandEncoder> MPSStream::commandEncoder() {
 
 void MPSStream::synchronize(SyncType syncType) {
   endKernelCoalescing();
+  if (syncType != SyncType::NONE) {
+    _pendingOpsCount++;
+  }
   switch (syncType) {
     case SyncType::NONE:
       // typically in GPU to GPU copies we won't commit explicitly
@@ -80,7 +83,9 @@ void MPSStream::synchronize(SyncType syncType) {
       break;
     case SyncType::COMMIT_ADAPTIVE:
       // the adaptive commit only commits if we hit the low watermark memory threshold
-      if (getIMPSAllocator()->getLowWatermarkValue() <= 1) {
+      // or if a sufficient number of ops have accumulated
+      if (getIMPSAllocator()->getLowWatermarkValue() <= 1 ||
+          _pendingOpsCount >= kAdaptiveOpThreshold) {
         commit();
       }
       break;
@@ -96,6 +101,7 @@ void MPSStream::synchronize(SyncType syncType) {
 }
 
 void MPSStream::commit() {
+  _pendingOpsCount = 0;
   if (_enableCommitAndContinue) {
     [commandBuffer() commitAndContinue];
   } else {
@@ -104,6 +110,7 @@ void MPSStream::commit() {
 }
 
 void MPSStream::commitAndWait() {
+  _pendingOpsCount = 0;
   if (_prevCommandBuffer) {
     // the previous command buffer (if exists) has already been committed,
     // so we just wait until it's completed and then dispose it.
@@ -136,6 +143,7 @@ void MPSStream::endKernelCoalescing() {
 }
 
 void MPSStream::flush() {
+  _pendingOpsCount = 0;
   if (_commandBuffer) {
     [_commandBuffer commit];
     // if commitAndContinue is disabled (e.g., for Profiler), we keep the command

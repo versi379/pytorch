@@ -51,6 +51,8 @@ enum class SyncType {
   COMMIT_ADAPTIVE, // commit adaptively based on available memory
 };
 
+static constexpr uint32_t kAdaptiveOpThreshold = 32;
+
 class TORCH_API MPSStream {
  public:
   enum Unchecked { UNCHECKED };
@@ -132,6 +134,8 @@ class TORCH_API MPSStream {
   void commitAndWait();
   void commitAndContinue();
   void flush();
+
+  uint32_t _pendingOpsCount = 0;
 };
 
 /**
