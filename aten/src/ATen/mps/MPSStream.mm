@@ -86,6 +86,7 @@ void MPSStream::synchronize(SyncType syncType) {
       // or if a sufficient number of ops have accumulated
       if (getIMPSAllocator()->getLowWatermarkValue() <= 1 ||
           _pendingOpsCount >= kAdaptiveOpThreshold) {
+        // NSLog(@"[MPS commit] ops=%u mem=%d", _pendingOpsCount, getIMPSAllocator()->getLowWatermarkValue());
         commit();
       }
       break;

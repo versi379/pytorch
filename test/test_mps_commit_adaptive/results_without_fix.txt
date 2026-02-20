@@ -1,0 +1,47 @@
+mode: without_fix  |  PyTorch: /Users/giovanniversiglioni/dev/pytorch/torch/__init__.py
+
+COMMITS
+Commit counts observed over 10 trials via [MPS commit] NSLog.
+The trigger is disabled, so no periodic commits should fire.
+pass = 0 or 1 commits observed (1 is warm-up noise).
+
+            op      N     commits    expected       
+  --------------------------------------------
+          relu     16           1           0   skip
+          relu     32           1          10   pass
+          relu     64           1          20   pass
+          relu    128           1          40   pass
+          relu    256           1          80   pass
+    matmul_256     16           1           0   skip
+    matmul_256     32           1          10   pass
+    matmul_256     64           1          20   pass
+    matmul_256    128           1          40   pass
+    matmul_256    256           1          80   pass
+    matmul_512     16           1           0   skip
+    matmul_512     32           1          10   pass
+    matmul_512     64           1          20   pass
+    matmul_512    128           1          40   pass
+    matmul_512    256           1          80   pass
+
+LATENCY
+Wall time per N ops (trimmed mean over 10 trials).
+Without the trigger the GPU only starts at synchronize(), so wall time = encode + execute.
+
+            op      N    wall ms
+  ------------------------------
+          relu     16       0.71
+          relu     32       1.04
+          relu     64       1.78
+          relu    128       2.40
+          relu    256       4.88
+    matmul_256     16       1.11
+    matmul_256     32       1.84
+    matmul_256     64       1.90
+    matmul_256    128       3.03
+    matmul_256    256       5.12
+    matmul_512     16       2.14
+    matmul_512     32       2.95
+    matmul_512     64       4.18
+    matmul_512    128       8.77
+    matmul_512    256      15.13
+
