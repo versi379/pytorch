@@ -179,7 +179,7 @@ MPSGraphTensor* mpsGraphScalarPlaceHolder(MPSGraph* mpsGraph, const Scalar& scal
 
 std::string get_mem_format_string(c10::MemoryFormat memory_format);
 
-using MPSCacheKey = uint64_t;
+using MPSCacheKey = std::string;
 
 struct MPSCachedKernel {
   MPSCachedKernel(NSObject* object) : _object([object retain]) {}
@@ -285,16 +285,15 @@ struct MPSKernelCache {
 
   MPSCachedKernel* CreateCachedKernel(const std::string& key, CreateCachedKernelBlock createCacheBlock) {
     __block MPSCachedKernel* cachedKernel = nil;
-    MPSCacheKey hash = std::hash<std::string>{}(key);
     dispatch_sync_with_rethrow(serialQueue_, ^() {
-      auto it = cache_.find(hash);
+      auto it = cache_.find(key);
       if (it != cache_.end()) {
         auto& entry = it->second;
         TORCH_INTERNAL_ASSERT_DEBUG_ONLY(key == entry.key_, "Key collision in the MPS cached kernel!\n");
         cachedKernel = entry.cachedKernel_;
       } else {
         cachedKernel = createCacheBlock();
-        cache_.try_emplace(hash, key, cachedKernel);
+        cache_.try_emplace(key, key, cachedKernel);
       }
     });
     return cachedKernel;
@@ -307,9 +306,8 @@ struct MPSKernelCache {
   MPSCachedKernel* LookUp(const std::string& key) const {
     __block MPSCachedKernel* cachedKernel = nil;
 
-    MPSCacheKey hash = std::hash<std::string>{}(key);
     dispatch_sync_with_rethrow(serialQueue_, ^() {
-      auto it = cache_.find(hash);
+      auto it = cache_.find(key);
       if (it != cache_.end()) {
         auto& entry = it->second;
         TORCH_INTERNAL_ASSERT_DEBUG_ONLY(key == entry.key_, "Key collision in the MPS cached kernel!\n");
@@ -382,18 +380,16 @@ struct MPSGraphCache {
   MPSCachedGraph* CreateCachedGraph(const std::string& key, CreateCachedGraphBlock createCacheBlock) {
     __block MPSCachedGraph* cachedGraph = nil;
 
-    MPSCacheKey hash = std::hash<std::string>{}(key);
-
     dispatch_sync_with_rethrow(serialQueue_, ^() {
       // verify the cached entry doesn't already exist
-      auto it = cache_.find(hash);
+      auto it = cache_.find(key);
       if (it != cache_.end()) {
         auto& entry = it->second;
         TORCH_INTERNAL_ASSERT_DEBUG_ONLY(key == entry.key_, "Key collision in the MPS cached graph!\n");
         cachedGraph = entry.cachedGraph_;
       } else {
         cachedGraph = createCacheBlock();
-        auto inserted = cache_.try_emplace(hash, key, cachedGraph).first;
+        auto inserted = cache_.try_emplace(key, key, cachedGraph).first;
         profileCachedGraph(inserted->second);
       }
     });
@@ -408,10 +404,8 @@ struct MPSGraphCache {
   MPSCachedGraph* LookUp(const std::string& key) const {
     __block MPSCachedGraph* cachedGraph = nullptr;
 
-    MPSCacheKey hash = std::hash<std::string>{}(key);
-
     dispatch_sync(serialQueue_, ^() {
-      auto it = cache_.find(hash);
+      auto it = cache_.find(key);
       if (it != cache_.end()) {
         auto& entry = it->second;
         TORCH_INTERNAL_ASSERT_DEBUG_ONLY(key == entry.key_, "Key collision in the MPS cached graph!\n");
