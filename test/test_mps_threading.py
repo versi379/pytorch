@@ -13,7 +13,6 @@ Run only on MPS:
 """
 import os
 import threading
-import time
 import unittest
 
 import torch
@@ -29,6 +28,13 @@ class TestMPSThreading(unittest.TestCase):
     def _run_threads(self, targets, duration):
         """Run each callable in `targets` on its own thread for `duration`
         seconds. Re-raise the first exception any thread saw.
+
+        If a worker fails early, `stop.wait` returns immediately so the test
+        finishes fast instead of soaking the full duration.
+
+        If a worker is still alive after a 5 s join, fail loudly: a hung
+        thread mid-MPS-op would otherwise leak into the next test and
+        contaminate its state (fresh tensors, fresh optimizer, etc.).
         """
         stop = threading.Event()
         errors = []
@@ -50,10 +56,17 @@ class TestMPSThreading(unittest.TestCase):
             t.start()
             threads.append(t)
 
-        time.sleep(duration)
+        stop.wait(duration)
         stop.set()
         for t in threads:
             t.join(timeout=5.0)
+
+        hung = [t for t in threads if t.is_alive()]
+        if hung:
+            self.fail(
+                f"{len(hung)} worker thread(s) did not exit within 5s; "
+                f"possible deadlock"
+            )
 
         if errors:
             raise errors[0]
