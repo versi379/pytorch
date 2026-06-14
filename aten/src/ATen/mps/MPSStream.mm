@@ -93,30 +93,36 @@ void MPSStream::synchronize(SyncType syncType) {
   // If we're already on _serialQueue (re-entrant call from inside an
   // existing dispatch_sync block), run the body inline to avoid a
   // recursive-dispatch_sync deadlock. Otherwise dispatch onto the queue
-  // so cross-thread callers serialize correctly.
+  // so cross-thread callers serialize correctly. The @autoreleasepool
+  // mirrors the pattern used by copy() and addCompletedHandler in this
+  // file: Metal/MPSGraph paths produce autoreleased NSError and scratch
+  // objects that should drain at block boundary, not at GCD worker
+  // thread teardown.
   auto body = ^{
-    endKernelCoalescing();
-    switch (syncType) {
-      case SyncType::NONE:
-        // typically in GPU to GPU copies we won't commit explicitly
-        break;
-      case SyncType::COMMIT:
-        commit();
-        break;
-      case SyncType::COMMIT_ADAPTIVE:
-        // the adaptive commit only commits if we hit the low watermark memory threshold
-        if (getIMPSAllocator()->getLowWatermarkValue() <= 1) {
+    @autoreleasepool {
+      endKernelCoalescing();
+      switch (syncType) {
+        case SyncType::NONE:
+          // typically in GPU to GPU copies we won't commit explicitly
+          break;
+        case SyncType::COMMIT:
           commit();
-        }
-        break;
-      case SyncType::COMMIT_AND_WAIT:
-        commitAndWait();
-        break;
-      case SyncType::COMMIT_AND_CONTINUE:
-        TORCH_INTERNAL_ASSERT_DEBUG_ONLY(_enableCommitAndContinue,
-                                         "CommitAndContinue is called but it is disabled globally!");
-        commitAndContinue();
-        break;
+          break;
+        case SyncType::COMMIT_ADAPTIVE:
+          // the adaptive commit only commits if we hit the low watermark memory threshold
+          if (getIMPSAllocator()->getLowWatermarkValue() <= 1) {
+            commit();
+          }
+          break;
+        case SyncType::COMMIT_AND_WAIT:
+          commitAndWait();
+          break;
+        case SyncType::COMMIT_AND_CONTINUE:
+          TORCH_INTERNAL_ASSERT_DEBUG_ONLY(_enableCommitAndContinue,
+                                           "CommitAndContinue is called but it is disabled globally!");
+          commitAndContinue();
+          break;
+      }
     }
   };
   if (_onSerialQueue()) {
