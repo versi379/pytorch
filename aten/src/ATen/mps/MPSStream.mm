@@ -155,6 +155,8 @@ void MPSStream::synchronize(SyncType syncType) {
 }
 
 void MPSStream::commit() {
+  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(_onSerialQueue(),
+      "MPSStream::commit() called off _serialQueue");
   if (_enableCommitAndContinue) {
     [commandBuffer() commitAndContinue];
   } else {
@@ -163,6 +165,8 @@ void MPSStream::commit() {
 }
 
 void MPSStream::commitAndWait() {
+  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(_onSerialQueue(),
+      "MPSStream::commitAndWait() called off _serialQueue");
   if (_prevCommandBuffer) {
     // the previous command buffer (if exists) has already been committed,
     // so we just wait until it's completed and then dispose it.
@@ -182,6 +186,8 @@ void MPSStream::commitAndWait() {
 }
 
 void MPSStream::commitAndContinue() {
+  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(_onSerialQueue(),
+      "MPSStream::commitAndContinue() called off _serialQueue");
   assert(_commandBuffer);
   [_commandBuffer commitAndContinue];
 }
@@ -205,6 +211,8 @@ void MPSStream::endKernelCoalescing() {
 }
 
 void MPSStream::flush() {
+  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(_onSerialQueue(),
+      "MPSStream::flush() called off _serialQueue");
   if (_commandBuffer) {
     [_commandBuffer commit];
     // if commitAndContinue is disabled (e.g., for Profiler), we keep the command
