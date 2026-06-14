@@ -80,9 +80,16 @@ void MPSHooks::commitStream() const {
 
 void* MPSHooks::getCommandBuffer() const {
   auto stream = at::mps::getDefaultMPSStream();
-  // Release pending computeCommandEncoder, as extensions is likely to allocate new one
-  stream->endKernelCoalescing();
-  return stream->commandBuffer();
+  __block void* result = nullptr;
+  // End coalescing and grab the buffer atomically with respect to other
+  // threads — otherwise another thread could lazy-init a new encoder
+  // between the two calls and we'd return a buffer whose encoder state
+  // doesn't match what the caller expects.
+  at::mps::dispatch_sync_with_rethrow(stream->queue(), ^{
+    stream->endKernelCoalescing();
+    result = stream->commandBuffer();
+  });
+  return result;
 }
 
 void* MPSHooks::getDispatchQueue() const {
