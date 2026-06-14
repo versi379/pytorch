@@ -28,7 +28,13 @@ def device_count() -> int:
 
 
 def synchronize() -> None:
-    r"""Waits for all kernels in all streams on a MPS device to complete."""
+    r"""Waits for all kernels in all streams on a MPS device to complete.
+
+    .. note::
+       Safe to call from any thread. Concurrent calls — including from
+       background threads while ATen MPS ops run on another thread — are
+       serialized internally via the MPS stream's GCD serial queue.
+    """
     return torch._C._mps_deviceSynchronize()
 
 
