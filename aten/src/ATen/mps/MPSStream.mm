@@ -15,6 +15,15 @@
 @end
 
 namespace at::mps {
+
+// Anonymous-namespace key used with dispatch_queue_set_specific so each
+// MPSStream's _serialQueue can be identified at runtime (for re-entrancy
+// detection in the public methods below). Address-of-key is what GCD
+// compares; the value stored is the MPSStream* that owns the queue.
+namespace {
+char kSerialQueueOwnerKey;
+}  // namespace
+
 //-----------------------------------------------------------------
 //  MPSStream
 //-----------------------------------------------------------------
@@ -23,6 +32,8 @@ MPSStream::MPSStream(Stream stream) : _stream(stream) {
   _commandQueue = [MPSDevice::getInstance()->device() newCommandQueue];
   TORCH_CHECK(_stream.device_type() == DeviceType::MPS);
   _serialQueue = dispatch_queue_create("metal gpu stream", nullptr);
+  // Tag the queue so _onSerialQueue() can detect re-entrancy.
+  dispatch_queue_set_specific(_serialQueue, &kSerialQueueOwnerKey, this, NULL);
   _executionDescriptor = [MPSGraphExecutionDescriptor new];
   _compilationDescriptor = [MPSGraphCompilationDescriptor new];
 
@@ -72,6 +83,10 @@ id<MTLComputeCommandEncoder> MPSStream::commandEncoder() {
   }
 
   return _commandEncoder;
+}
+
+bool MPSStream::_onSerialQueue() const {
+  return dispatch_get_specific(&kSerialQueueOwnerKey) == this;
 }
 
 void MPSStream::synchronize(SyncType syncType) {

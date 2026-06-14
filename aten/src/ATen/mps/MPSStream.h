@@ -56,6 +56,16 @@ enum class SyncType {
   COMMIT_ADAPTIVE, // commit adaptively based on available memory
 };
 
+// Thread-safety contract:
+//   All access to _commandBuffer, _commandEncoder, and _prevCommandBuffer
+//   must be performed on _serialQueue (the GCD serial queue returned by
+//   queue()). The public methods synchronize(), commandBuffer(),
+//   commandEncoder(), and endKernelCoalescing() enforce this internally:
+//   if the calling thread is already executing on _serialQueue (e.g. it
+//   reached this method from inside a dispatch_sync_with_rethrow(queue(),
+//   ...) block), the body runs inline; otherwise it is dispatched onto
+//   _serialQueue. Callers may freely call these methods from any thread,
+//   with or without an outer dispatch_sync wrapper.
 class TORCH_API MPSStream {
  public:
   enum Unchecked { UNCHECKED };
@@ -130,6 +140,11 @@ class TORCH_API MPSStream {
   bool _enableCommitAndContinue = true;
   // Buffer that contains last raised error
   MTLBuffer_t _errorBuffer = nil;
+
+  // True iff the calling thread is currently executing on _serialQueue.
+  // Used by the public entry points to detect re-entrancy and avoid a
+  // recursive dispatch_sync deadlock.
+  bool _onSerialQueue() const;
 
   // use synchronize() to access any of these commit functions outside MPSStream
   void commit();
