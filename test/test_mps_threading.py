@@ -13,6 +13,7 @@ Run only on MPS:
 """
 import os
 import threading
+import time
 import unittest
 
 import torch
@@ -141,18 +142,27 @@ class TestMPSThreading(unittest.TestCase):
             [worker_train, worker_render], self.SOAK_SECONDS
         )
 
-    def test_synchronize_from_within_extension_dispatch(self):
-        """An extension that wraps its work in dispatch_sync(stream->queue())
-        and then calls torch.mps.synchronize() must not deadlock.
+    def test_single_thread_synchronize_interleaved_with_ops(self):
+        """Single-threaded smoke: interleaving ATen MPS ops with explicit
+        torch.mps.synchronize() calls completes without crash or hang.
 
-        We approximate this from Python by issuing many ATen MPS ops
-        (which go through dispatch_sync_with_rethrow internally) interleaved
-        with synchronize calls on the same thread. If the re-entrancy
-        detection is broken, the second synchronize would deadlock.
+        This is a weak smoke test, NOT a true re-entrancy test. A genuine
+        re-entrancy test would need a custom C++ extension that does
+        dispatch_sync(stream->queue(), ^{ stream->synchronize(); }), so
+        the inner synchronize() sees _onSerialQueue() == true and runs
+        inline instead of recursively dispatch_syncing. Python can never
+        construct that state because ATen MPS ops complete (their
+        dispatch_sync_with_rethrow returns) before Python regains control.
+
+        A real re-entrancy regression test belongs in a follow-up Phase 2
+        plan that introduces a small test extension; this single-threaded
+        check serves as a tripwire for the most obvious mistake (a wrapper
+        that always dispatch_syncs unconditionally and deadlocks the
+        process).
         """
         x = torch.randn(64, 64, device="mps")
         w = torch.randn(64, 64, device="mps")
-        import time
+        assert x.device.type == "mps", "test requires MPS-backed tensors"
         deadline = time.time() + min(2.0, self.SOAK_SECONDS)
         while time.time() < deadline:
             for _ in range(50):
