@@ -226,12 +226,18 @@ void MPSStream::flush() {
   }
 }
 
+// Same re-entrancy + @autoreleasepool pattern as synchronize(); see comment there.
 void MPSStream::addCompletedHandler(MTLCommandBufferHandler block) {
-  dispatch_sync(_serialQueue, ^() {
+  auto body = ^{
     @autoreleasepool {
       [commandBuffer() addCompletedHandler:block];
     }
-  });
+  };
+  if (_onSerialQueue()) {
+    body();
+  } else {
+    dispatch_sync_with_rethrow(_serialQueue, body);
+  }
 }
 
 void MPSStream::copy(id<MTLBuffer> srcBuffer,
