@@ -141,6 +141,26 @@ class TestMPSThreading(unittest.TestCase):
             [worker_train, worker_render], self.SOAK_SECONDS
         )
 
+    def test_synchronize_from_within_extension_dispatch(self):
+        """An extension that wraps its work in dispatch_sync(stream->queue())
+        and then calls torch.mps.synchronize() must not deadlock.
+
+        We approximate this from Python by issuing many ATen MPS ops
+        (which go through dispatch_sync_with_rethrow internally) interleaved
+        with synchronize calls on the same thread. If the re-entrancy
+        detection is broken, the second synchronize would deadlock.
+        """
+        x = torch.randn(64, 64, device="mps")
+        w = torch.randn(64, 64, device="mps")
+        import time
+        deadline = time.time() + min(2.0, self.SOAK_SECONDS)
+        while time.time() < deadline:
+            for _ in range(50):
+                y = x @ w
+            torch.mps.synchronize()
+            _ = y.sum().item()
+            torch.mps.synchronize()
+
 
 if __name__ == "__main__":
     unittest.main()
