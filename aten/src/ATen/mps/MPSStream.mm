@@ -65,6 +65,7 @@ MPSStream::~MPSStream() {
   assert(_commandBuffer == nil);
 }
 
+// Same re-entrancy + @autoreleasepool pattern as synchronize(); see comment there.
 MPSCommandBuffer* MPSStream::commandBuffer() {
   __block MPSCommandBuffer* result = nil;
   auto body = ^{
@@ -87,12 +88,23 @@ id<MTLDevice> MPSStream::device() const {
   return [_commandQueue device];
 }
 
+// Same re-entrancy + @autoreleasepool pattern as synchronize(); see comment there.
 id<MTLComputeCommandEncoder> MPSStream::commandEncoder() {
-  if (!_commandEncoder) {
-    _commandEncoder = [commandBuffer() computeCommandEncoder].retain;
+  __block id<MTLComputeCommandEncoder> result = nil;
+  auto body = ^{
+    @autoreleasepool {
+      if (!_commandEncoder) {
+        _commandEncoder = [commandBuffer() computeCommandEncoder].retain;
+      }
+      result = _commandEncoder;
+    }
+  };
+  if (_onSerialQueue()) {
+    body();
+  } else {
+    dispatch_sync_with_rethrow(_serialQueue, body);
   }
-
-  return _commandEncoder;
+  return result;
 }
 
 bool MPSStream::_onSerialQueue() const {
@@ -174,11 +186,21 @@ void MPSStream::commitAndContinue() {
   [_commandBuffer commitAndContinue];
 }
 
+// Same re-entrancy + @autoreleasepool pattern as synchronize(); see comment there.
 void MPSStream::endKernelCoalescing() {
-  if (_commandEncoder) {
-    [_commandEncoder endEncoding];
-    [_commandEncoder release];
-    _commandEncoder = nil;
+  auto body = ^{
+    @autoreleasepool {
+      if (_commandEncoder) {
+        [_commandEncoder endEncoding];
+        [_commandEncoder release];
+        _commandEncoder = nil;
+      }
+    }
+  };
+  if (_onSerialQueue()) {
+    body();
+  } else {
+    dispatch_sync_with_rethrow(_serialQueue, body);
   }
 }
 
