@@ -32,7 +32,13 @@ MPSStream::MPSStream(Stream stream) : _stream(stream) {
   _commandQueue = [MPSDevice::getInstance()->device() newCommandQueue];
   TORCH_CHECK(_stream.device_type() == DeviceType::MPS);
   _serialQueue = dispatch_queue_create("metal gpu stream", nullptr);
-  // Tag the queue so _onSerialQueue() can detect re-entrancy.
+  // Tag the queue so _onSerialQueue() can detect re-entrancy. The stored
+  // context is `this`, which is safe because MPSStream is a process-
+  // lifetime singleton (MPSStreamImpl::_stream, never destroyed). If
+  // Phase 2 introduces non-singleton streams, ~MPSStream will need to
+  // pass a destructor function as the 4th arg (or call
+  // dispatch_queue_set_specific(_serialQueue, &kSerialQueueOwnerKey,
+  // nullptr, NULL) before the queue is released).
   dispatch_queue_set_specific(_serialQueue, &kSerialQueueOwnerKey, this, NULL);
   _executionDescriptor = [MPSGraphExecutionDescriptor new];
   _compilationDescriptor = [MPSGraphCompilationDescriptor new];

@@ -60,12 +60,13 @@ enum class SyncType {
 //   All access to _commandBuffer, _commandEncoder, and _prevCommandBuffer
 //   must be performed on _serialQueue (the GCD serial queue returned by
 //   queue()). The public methods synchronize(), commandBuffer(),
-//   commandEncoder(), and endKernelCoalescing() enforce this internally:
-//   if the calling thread is already executing on _serialQueue (e.g. it
-//   reached this method from inside a dispatch_sync_with_rethrow(queue(),
-//   ...) block), the body runs inline; otherwise it is dispatched onto
-//   _serialQueue. Callers may freely call these methods from any thread,
-//   with or without an outer dispatch_sync wrapper.
+//   commandEncoder(), endKernelCoalescing(), and addCompletedHandler()
+//   enforce this internally: if the calling thread is already executing
+//   on _serialQueue (e.g. it reached this method from inside a
+//   dispatch_sync_with_rethrow(queue(), ...) block), the body runs inline;
+//   otherwise it is dispatched onto _serialQueue. Callers may freely call
+//   these methods from any thread, with or without an outer dispatch_sync
+//   wrapper.
 class TORCH_API MPSStream {
  public:
   enum Unchecked { UNCHECKED };
