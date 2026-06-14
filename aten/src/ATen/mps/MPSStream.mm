@@ -66,11 +66,21 @@ MPSStream::~MPSStream() {
 }
 
 MPSCommandBuffer* MPSStream::commandBuffer() {
-  if (!_commandBuffer) {
-    _commandBuffer = [MPSCommandBuffer commandBufferFromCommandQueue:_commandQueue].retain;
+  __block MPSCommandBuffer* result = nil;
+  auto body = ^{
+    @autoreleasepool {
+      if (!_commandBuffer) {
+        _commandBuffer = [MPSCommandBuffer commandBufferFromCommandQueue:_commandQueue].retain;
+      }
+      result = _commandBuffer;
+    }
+  };
+  if (_onSerialQueue()) {
+    body();
+  } else {
+    dispatch_sync_with_rethrow(_serialQueue, body);
   }
-
-  return _commandBuffer;
+  return result;
 }
 
 id<MTLDevice> MPSStream::device() const {
