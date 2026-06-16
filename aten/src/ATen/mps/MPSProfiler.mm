@@ -473,12 +473,11 @@ void MPSProfiler::addProfilerScheduledHandler(BaseInfo& info, MPSStream* stream)
   const os_signpost_id_t intervalSignpostId = info.intervalSignpostId;
 
   MPSStream* profileStream = stream ? stream : getDefaultMPSStream();
-  // NOTE: the following block isn't thread-safe
-  [profileStream->commandBuffer() addScheduledHandler:^(id<MTLCommandBuffer> cb) {
+  profileStream->addScheduledHandler(^(id<MTLCommandBuffer> cb) {
     // begin the interval once scheduling has completed (if INCLUDE_SCHEDULE_INTERVAL flag is disabled)
     beginSignpostInterval(signpostType, intervalSignpostId, info.toString());
     info.completed = false;
-  }];
+  });
 }
 
 void MPSProfiler::updateCopyStats(const CopyInfo& copyInfo, double gpuTime, double schedulingTime) {
@@ -512,15 +511,14 @@ void MPSProfiler::addProfilerCompletedHandler(BaseInfo& info, SyncType syncType,
   hasPendingCompletionHandlers = true;
 
   MPSStream* profileStream = stream ? stream : getDefaultMPSStream();
-  // NOTE: the following block isn't thread-safe
-  [profileStream->commandBuffer() addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+  profileStream->addCompletedHandler(^(id<MTLCommandBuffer> cb) {
     CFTimeInterval gpuTime = cb.GPUEndTime > cb.GPUStartTime ? (cb.GPUEndTime - cb.GPUStartTime) * 1000.0 : 0.;
     CFTimeInterval schedulingTime =
         cb.kernelEndTime > cb.kernelStartTime ? (cb.kernelEndTime - cb.kernelStartTime) * 1000.0 : 0.;
 
     endProfileExecution(info, eventSignpostId, intervalSignpostId, gpuTime, schedulingTime);
     hasPendingCompletionHandlers = false;
-  }];
+  });
 
   profileStream->synchronize((m_profile_options & ProfileOptions::WAIT_UNTIL_COMPLETED) ? SyncType::COMMIT_AND_WAIT
                                                                                         : syncType);
