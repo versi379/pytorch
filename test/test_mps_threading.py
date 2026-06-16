@@ -17,6 +17,7 @@ import time
 import unittest
 
 import torch
+import torch.utils.cpp_extension
 
 
 @unittest.skipUnless(
@@ -143,22 +144,10 @@ class TestMPSThreading(unittest.TestCase):
         )
 
     def test_single_thread_synchronize_interleaved_with_ops(self):
-        """Single-threaded smoke: interleaving ATen MPS ops with explicit
-        torch.mps.synchronize() calls completes without crash or hang.
+        """Smoke: interleaving MPS ops with explicit synchronize() must not crash or hang.
 
-        This is a weak smoke test, NOT a true re-entrancy test. A genuine
-        re-entrancy test would need a custom C++ extension that does
-        dispatch_sync(stream->queue(), ^{ stream->synchronize(); }), so
-        the inner synchronize() sees _onSerialQueue() == true and runs
-        inline instead of recursively dispatch_syncing. Python can never
-        construct that state because ATen MPS ops complete (their
-        dispatch_sync_with_rethrow returns) before Python regains control.
-
-        A real re-entrancy regression test belongs in a follow-up Phase 2
-        plan that introduces a small test extension; this single-threaded
-        check serves as a tripwire for the most obvious mistake (a wrapper
-        that always dispatch_syncs unconditionally and deadlocks the
-        process).
+        Not a true re-entrancy test — Python cannot construct a re-entrant call into
+        the serial queue; that requires a C++ extension (Phase 2 work).
         """
         x = torch.randn(64, 64, device="mps")
         w = torch.randn(64, 64, device="mps")
@@ -170,6 +159,69 @@ class TestMPSThreading(unittest.TestCase):
             torch.mps.synchronize()
             _ = y.sum().item()
             torch.mps.synchronize()
+
+    def test_eye_concurrent_with_matmul(self):
+        """Reproduces a race where torch.eye() (and other ops sharing the
+        Eye-style pattern) capture the cached MPSStream compute encoder
+        OUTSIDE the dispatch_sync block, then encode to it inside. Between
+        the off-queue capture and the dispatch_sync, another thread can
+        run torch.mps.synchronize() or any commit path, which ends and
+        releases the cached encoder. The first thread's captured pointer
+        then dangles.
+
+        Pre-fix observed manifestations (depending on what GCD recycled
+        the address as):
+          - NSInvalidArgumentException: `-[OS_dispatch_mach setComputePipelineState:]:
+            unrecognized selector sent to instance ...`
+          - Metal assertion: `tryCoalescingPreviousComputeCommandEncoderWithConfig:
+            nextEncoderClass:` ... `A command encoder is already encoding to
+            this command buffer`
+
+        Post-fix the captured pointer is constructed inside the dispatch_sync,
+        so no other thread can interleave between capture and use; the test
+        must run cleanly for SOAK_SECONDS.
+        """
+        def worker_eye():
+            for _ in range(8):
+                _ = torch.eye(100, 100, device="mps")
+                _ = torch.eye(50, 50, device="mps")
+
+        def worker_sync():
+            torch.mps.synchronize()
+
+        def worker_matmul():
+            a = torch.randn(64, 64, device="mps")
+            b = torch.randn(64, 64, device="mps")
+            for _ in range(20):
+                c = a @ b
+            _ = c.sum().item()
+
+        self._run_threads(
+            [worker_eye, worker_sync, worker_eye, worker_sync,
+             worker_matmul, worker_matmul],
+            self.SOAK_SECONDS,
+        )
+
+    def test_reentrancy_probe_under_load(self):
+        """probe_mps_reentrancy() must be safe when called concurrently from
+        multiple threads. Each thread dispatch_syncs to the serial queue; GCD
+        serialises them. Verifies no crash or deadlock under concurrent load.
+        """
+        _ext_path = os.path.join(
+            os.path.dirname(__file__), "cpp_extensions", "mps_extension.mm"
+        )
+        module = torch.utils.cpp_extension.load(
+            name="torch_test_mps_extension",
+            sources=[_ext_path],
+            verbose=False,
+            keep_intermediates=False,
+        )
+        _ = torch.zeros(1, device="mps")
+
+        def worker():
+            module.probe_mps_reentrancy()
+
+        self._run_threads([worker, worker, worker], self.SOAK_SECONDS)
 
 
 if __name__ == "__main__":
