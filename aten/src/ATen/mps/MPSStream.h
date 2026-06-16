@@ -56,17 +56,11 @@ enum class SyncType {
   COMMIT_ADAPTIVE, // commit adaptively based on available memory
 };
 
-// Thread-safety contract:
-//   All access to _commandBuffer, _commandEncoder, and _prevCommandBuffer
-//   must be performed on _serialQueue (the GCD serial queue returned by
-//   queue()). The public methods synchronize(), commandBuffer(),
-//   commandEncoder(), endKernelCoalescing(), and addCompletedHandler()
-//   enforce this internally: if the calling thread is already executing
-//   on _serialQueue (e.g. it reached this method from inside a
-//   dispatch_sync_with_rethrow(queue(), ...) block), the body runs inline;
-//   otherwise it is dispatched onto _serialQueue. Callers may freely call
-//   these methods from any thread, with or without an outer dispatch_sync
-//   wrapper.
+// Thread-safety contract: _commandBuffer, _commandEncoder, and _prevCommandBuffer
+// must only be accessed on _serialQueue. The public methods below enforce this by
+// detecting re-entrant calls (via _onSerialQueue()) and running inline rather than
+// issuing a recursive dispatch_sync that would deadlock. Callers may freely invoke
+// these methods from any thread.
 class TORCH_API MPSStream {
  public:
   enum Unchecked { UNCHECKED };
@@ -108,6 +102,7 @@ class TORCH_API MPSStream {
                        NSDictionary* results,
                        SyncType syncType = SyncType::NONE);
   void addCompletedHandler(MTLCommandBufferHandler block);
+  void addScheduledHandler(MTLCommandBufferHandler block);
 
   /// Get the MPS device index that this stream is associated with.
   c10::DeviceIndex device_index() const {
@@ -146,6 +141,12 @@ class TORCH_API MPSStream {
   // Used by the public entry points to detect re-entrancy and avoid a
   // recursive dispatch_sync deadlock.
   bool _onSerialQueue() const;
+
+#ifdef __OBJC__
+  // Runs body() inline if already on _serialQueue, otherwise dispatches via
+  // dispatch_sync_with_rethrow. All public Metal-state accessors use this.
+  void runOnQueue(dispatch_block_t body);
+#endif
 
   // use synchronize() to access any of these commit functions outside MPSStream
   void commit();

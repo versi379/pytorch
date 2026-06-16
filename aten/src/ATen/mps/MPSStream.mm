@@ -32,13 +32,9 @@ MPSStream::MPSStream(Stream stream) : _stream(stream) {
   _commandQueue = [MPSDevice::getInstance()->device() newCommandQueue];
   TORCH_CHECK(_stream.device_type() == DeviceType::MPS);
   _serialQueue = dispatch_queue_create("metal gpu stream", nullptr);
-  // Tag the queue so _onSerialQueue() can detect re-entrancy. The stored
-  // context is `this`, which is safe because MPSStream is a process-
-  // lifetime singleton (MPSStreamImpl::_stream, never destroyed). If
-  // Phase 2 introduces non-singleton streams, ~MPSStream will need to
-  // pass a destructor function as the 4th arg (or call
-  // dispatch_queue_set_specific(_serialQueue, &kSerialQueueOwnerKey,
-  // nullptr, NULL) before the queue is released).
+  // Tag the queue so _onSerialQueue() can detect re-entrancy. Safe because
+  // MPSStream is a process-lifetime singleton; a future non-singleton stream
+  // would need to clear this tag in its destructor.
   dispatch_queue_set_specific(_serialQueue, &kSerialQueueOwnerKey, this, NULL);
   _executionDescriptor = [MPSGraphExecutionDescriptor new];
   _compilationDescriptor = [MPSGraphCompilationDescriptor new];
@@ -59,6 +55,7 @@ MPSStream::MPSStream(Stream stream) : _stream(stream) {
 }
 
 MPSStream::~MPSStream() {
+  dispatch_queue_set_specific(_serialQueue, &kSerialQueueOwnerKey, nullptr, NULL);
   [_commandQueue release];
   _commandQueue = nil;
   [_executionDescriptor release];
@@ -71,22 +68,28 @@ MPSStream::~MPSStream() {
   assert(_commandBuffer == nil);
 }
 
-// Same re-entrancy + @autoreleasepool pattern as synchronize(); see comment there.
+bool MPSStream::_onSerialQueue() const {
+  return dispatch_get_specific(&kSerialQueueOwnerKey) == this;
+}
+
+void MPSStream::runOnQueue(dispatch_block_t body) {
+  if (_onSerialQueue()) {
+    body();
+  } else {
+    dispatch_sync_with_rethrow(_serialQueue, body);
+  }
+}
+
 MPSCommandBuffer* MPSStream::commandBuffer() {
   __block MPSCommandBuffer* result = nil;
-  auto body = ^{
+  runOnQueue(^{
     @autoreleasepool {
       if (!_commandBuffer) {
         _commandBuffer = [MPSCommandBuffer commandBufferFromCommandQueue:_commandQueue].retain;
       }
       result = _commandBuffer;
     }
-  };
-  if (_onSerialQueue()) {
-    body();
-  } else {
-    dispatch_sync_with_rethrow(_serialQueue, body);
-  }
+  });
   return result;
 }
 
@@ -94,39 +97,23 @@ id<MTLDevice> MPSStream::device() const {
   return [_commandQueue device];
 }
 
-// Same re-entrancy + @autoreleasepool pattern as synchronize(); see comment there.
 id<MTLComputeCommandEncoder> MPSStream::commandEncoder() {
   __block id<MTLComputeCommandEncoder> result = nil;
-  auto body = ^{
+  runOnQueue(^{
     @autoreleasepool {
       if (!_commandEncoder) {
         _commandEncoder = [commandBuffer() computeCommandEncoder].retain;
       }
       result = _commandEncoder;
     }
-  };
-  if (_onSerialQueue()) {
-    body();
-  } else {
-    dispatch_sync_with_rethrow(_serialQueue, body);
-  }
+  });
   return result;
 }
 
-bool MPSStream::_onSerialQueue() const {
-  return dispatch_get_specific(&kSerialQueueOwnerKey) == this;
-}
-
 void MPSStream::synchronize(SyncType syncType) {
-  // If we're already on _serialQueue (re-entrant call from inside an
-  // existing dispatch_sync block), run the body inline to avoid a
-  // recursive-dispatch_sync deadlock. Otherwise dispatch onto the queue
-  // so cross-thread callers serialize correctly. The @autoreleasepool
-  // mirrors the pattern used by copy() and addCompletedHandler in this
-  // file: Metal/MPSGraph paths produce autoreleased NSError and scratch
-  // objects that should drain at block boundary, not at GCD worker
-  // thread teardown.
-  auto body = ^{
+  // Dispatch to _serialQueue to serialize cross-thread callers; run inline if
+  // already on the queue to avoid a recursive dispatch_sync deadlock.
+  runOnQueue(^{
     @autoreleasepool {
       endKernelCoalescing();
       switch (syncType) {
@@ -152,12 +139,7 @@ void MPSStream::synchronize(SyncType syncType) {
           break;
       }
     }
-  };
-  if (_onSerialQueue()) {
-    body();
-  } else {
-    dispatch_sync_with_rethrow(_serialQueue, body);
-  }
+  });
 }
 
 void MPSStream::commit() {
@@ -198,9 +180,8 @@ void MPSStream::commitAndContinue() {
   [_commandBuffer commitAndContinue];
 }
 
-// Same re-entrancy + @autoreleasepool pattern as synchronize(); see comment there.
 void MPSStream::endKernelCoalescing() {
-  auto body = ^{
+  runOnQueue(^{
     @autoreleasepool {
       if (_commandEncoder) {
         [_commandEncoder endEncoding];
@@ -208,12 +189,7 @@ void MPSStream::endKernelCoalescing() {
         _commandEncoder = nil;
       }
     }
-  };
-  if (_onSerialQueue()) {
-    body();
-  } else {
-    dispatch_sync_with_rethrow(_serialQueue, body);
-  }
+  });
 }
 
 void MPSStream::flush() {
@@ -232,18 +208,20 @@ void MPSStream::flush() {
   }
 }
 
-// Same re-entrancy + @autoreleasepool pattern as synchronize(); see comment there.
 void MPSStream::addCompletedHandler(MTLCommandBufferHandler block) {
-  auto body = ^{
+  runOnQueue(^{
     @autoreleasepool {
       [commandBuffer() addCompletedHandler:block];
     }
-  };
-  if (_onSerialQueue()) {
-    body();
-  } else {
-    dispatch_sync_with_rethrow(_serialQueue, body);
-  }
+  });
+}
+
+void MPSStream::addScheduledHandler(MTLCommandBufferHandler block) {
+  runOnQueue(^{
+    @autoreleasepool {
+      [commandBuffer() addScheduledHandler:block];
+    }
+  });
 }
 
 void MPSStream::copy(id<MTLBuffer> srcBuffer,
