@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <ATen/mps/MPSStream.h>
 #include <ATen/native/mps/OperationUtils.h>
 
 // this sample custom kernel is taken from:
@@ -78,8 +79,23 @@ void mps_add_one_new_encoder(const at::Tensor& input) {
   }
 }
 
+// Exercises the _onSerialQueue()==true inline path in runOnQueue.
+// Calls synchronize() and commandBuffer() from inside a dispatch_sync on
+// the serial queue. Pre-Phase-1 this deadlocked; post-Phase-1 both calls
+// detect they are already on the queue and run inline.
+void probe_mps_reentrancy() {
+  auto* stream = at::mps::getDefaultMPSStream();
+  dispatch_sync(stream->queue(), ^{
+    @autoreleasepool {
+      stream->synchronize(at::mps::SyncType::COMMIT);
+      (void)stream->commandBuffer();
+    }
+  });
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("get_cpu_add_output", &get_cpu_add_output);
   m.def("get_mps_add_output", &get_mps_add_output);
   m.def("mps_add_one_new_context", &mps_add_one_new_encoder);
+  m.def("probe_mps_reentrancy", &probe_mps_reentrancy);
 }

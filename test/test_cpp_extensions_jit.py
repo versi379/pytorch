@@ -307,6 +307,27 @@ class TestCppExtensionJIT(common.TestCase):
         module.mps_add_one_new_context(mps_output)
         self.assertEqual(cpu_output + 1.0, mps_output.to("cpu"))
 
+    @unittest.skipIf(not TEST_MPS, "MPS not found")
+    def test_mps_stream_reentrancy(self):
+        """probe_mps_reentrancy() must complete without deadlock.
+
+        It calls stream->synchronize() and commandBuffer() from inside a
+        dispatch_sync on the serial queue, exercising the _onSerialQueue()==true
+        inline path that Python tests cannot reach.
+        """
+        module = torch.utils.cpp_extension.load(
+            name="torch_test_mps_extension",
+            sources=[
+                "cpp_extensions/mps_extension.mm",
+            ],
+            verbose=True,
+            keep_intermediates=False,
+        )
+        # Warm up: ensure the MPS device and stream are initialised.
+        _ = torch.zeros(1, device="mps")
+        # Must complete without deadlock or crash.
+        module.probe_mps_reentrancy()
+
     def _run_jit_cuda_archflags(self, flags, expected):
         # Compile an extension with given `flags`
         def _check_cuobjdump_output(expected_values, is_ptx=False):
