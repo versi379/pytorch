@@ -8,6 +8,7 @@
 #include <ATen/native/ReduceOpsUtils.h>
 #include <ATen/native/Resize.h>
 #include <ATen/native/SortingUtils.h>
+#include <ATen/native/TensorCompare.h>
 #include <ATen/native/TensorShape.h>
 #include <ATen/native/TypeProperties.h>
 #include <ATen/native/mps/OperationUtils.h>
@@ -681,6 +682,73 @@ static Tensor median_impl_mps(const Tensor& self, bool ignore_nan) {
   return out_val;
 }
 
+// mode: sort each slice along `dim` ascending, then a per-row scan picks the
+// value of the longest equal-run (strict >, so ties go to the smallest value)
+// and the original index of that run's last element in sorted order, matching
+// CPU's mode_kernel_impl in TensorCompareKernel.cpp.
+static void mode_kernel_impl_mps(Tensor& values, Tensor& indices, const Tensor& self, int64_t dim, bool keepdim) {
+  auto self_sizes = ensure_nonempty_vec(self.sizes().vec());
+  int64_t slice_size = ensure_nonempty_size(self, dim);
+
+  self_sizes[dim] = 1;
+  if (!keepdim) {
+    if (values.ndimension() >= dim) {
+      values.unsqueeze_(dim);
+    }
+    if (indices.ndimension() >= dim) {
+      indices.unsqueeze_(dim);
+    }
+  }
+  resize_output(values, self_sizes);
+  resize_output(indices, self_sizes);
+
+  if (slice_size == 1) {
+    values.copy_(self);
+    indices.fill_(0);
+    if (!keepdim) {
+      values.squeeze_(dim);
+      indices.squeeze_(dim);
+    }
+    return;
+  }
+
+  // Sort each slice along `dim` ascending on the last axis, then scan.
+  Tensor self_l = self.movedim(dim, -1).contiguous();
+  const auto sort_size = static_cast<uint32_t>(self_l.size(-1));
+  const int64_t n_rows = self_l.numel() / sort_size;
+  auto sorted_vals = at::empty(self_l.sizes(), self_l.options());
+  auto sorted_idxs = at::empty(self_l.sizes(), self_l.options().dtype(kLong));
+  sort_out_mps_impl(self_l, /*stable=*/false, self_l.dim() - 1, /*descending=*/false, sorted_vals, sorted_idxs);
+
+  auto out_vals = at::empty({n_rows}, self_l.options());
+  auto out_idxs = at::empty({n_rows}, self_l.options().dtype(kLong));
+
+  MPSStream* mpsStream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      auto enc = mpsStream->commandEncoder();
+      const auto kernel = fmt::format("mode_from_sorted_{}", scalarToMetalTypeString(self_l));
+      auto pso = lib.getPipelineStateForFunc(kernel);
+      getMPSProfiler().beginProfileKernel(pso, kernel, {sorted_vals}, mpsStream);
+      [enc setComputePipelineState:pso];
+      mtl_setArgs(enc, sorted_vals, sorted_idxs, out_vals, out_idxs, sort_size);
+      mtl_dispatch1DJob(enc, pso, n_rows);
+      getMPSProfiler().endProfileKernel(pso, mpsStream);
+    }
+  });
+
+  // out_* are flat over the reduced axis; reshape to the (dim-collapsed) slice shape.
+  auto out_shape = self_l.sizes().vec();
+  out_shape.back() = 1;
+  values.copy_(out_vals.view(out_shape).movedim(-1, dim));
+  indices.copy_(out_idxs.view(out_shape).movedim(-1, dim));
+
+  if (!keepdim) {
+    values.squeeze_(dim);
+    indices.squeeze_(dim);
+  }
+}
+
 } // namespace
 
 namespace mps {
@@ -797,4 +865,6 @@ std::tuple<Tensor&, Tensor&> nanmedian_out_mps(const Tensor& self,
                                                Tensor& indices) {
   return median_with_indices_impl_mps(values, indices, self, dim, keepdim, /*ignore_nan=*/self.is_floating_point());
 }
+
+REGISTER_DISPATCH(mode_stub, &mode_kernel_impl_mps)
 } // namespace at::native

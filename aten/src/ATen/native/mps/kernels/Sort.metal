@@ -203,3 +203,58 @@ INSTANTIATE_MEDIAN_SELECT(long);
 INSTANTIATE_MEDIAN_SELECT(short);
 INSTANTIATE_MEDIAN_SELECT(char);
 INSTANTIATE_MEDIAN_SELECT(uchar);
+
+// One thread per row scans a row already sorted ascending by value, tracking
+// the longest run of equal values. The strict > matches CPU
+// (TensorCompareKernel.cpp mode_kernel_impl): among values with the same max
+// frequency the smallest wins, and the winning index is the original index of
+// the last element of that run in sorted order.
+template <typename T>
+kernel void mode_from_sorted(
+    const device T* sorted_vals [[buffer(0)]],
+    const device long* sorted_idxs [[buffer(1)]],
+    device T* out_vals [[buffer(2)]],
+    device long* out_idxs [[buffer(3)]],
+    constant uint& sort_size [[buffer(4)]],
+    uint row [[thread_position_in_grid]]) {
+  const ulong base = ulong(row) * sort_size;
+  const device T* vals = sorted_vals + base;
+
+  T mode = vals[0];
+  long modei = sorted_idxs[base];
+  uint max_freq = 0;
+  uint temp_freq = 0;
+  for (uint i = 0; i < sort_size; i++) {
+    temp_freq++;
+    if (i == sort_size - 1 || vals[i] != vals[i + 1]) {
+      if (temp_freq > max_freq) {
+        mode = vals[i];
+        modei = sorted_idxs[base + i];
+        max_freq = temp_freq;
+      }
+      temp_freq = 0;
+    }
+  }
+  out_vals[row] = mode;
+  out_idxs[row] = modei;
+}
+
+#define INSTANTIATE_MODE_FROM_SORTED(T)                      \
+  template [[host_name("mode_from_sorted_" #T)]] kernel void \
+  mode_from_sorted<T>(                                       \
+      const device T*,                                       \
+      const device long*,                                    \
+      device T*,                                             \
+      device long*,                                          \
+      constant uint&,                                        \
+      uint);
+
+INSTANTIATE_MODE_FROM_SORTED(float);
+INSTANTIATE_MODE_FROM_SORTED(half);
+INSTANTIATE_MODE_FROM_SORTED(bfloat);
+INSTANTIATE_MODE_FROM_SORTED(int);
+INSTANTIATE_MODE_FROM_SORTED(long);
+INSTANTIATE_MODE_FROM_SORTED(short);
+INSTANTIATE_MODE_FROM_SORTED(char);
+INSTANTIATE_MODE_FROM_SORTED(uchar);
+INSTANTIATE_MODE_FROM_SORTED(bool);

@@ -389,7 +389,6 @@ if torch.backends.mps.is_available():
                 torch.uint8,
             ],
             "median": [torch.bool],
-            "mode": None,
             "nanmedian": [torch.bool],
             "native_batch_norm": [
                 torch.uint8,
@@ -724,6 +723,21 @@ if torch.backends.mps.is_available():
             # but in case of the returned indices this results in undefined behaviour.
             "sort": [
                 torch.int8,
+                torch.uint8,
+                torch.bool,
+                torch.float16,
+                torch.bfloat16,
+            ],
+            # mode returns (values, indices). Values always match CPU, but the
+            # index of a repeated mode value depends on the (unstable) sort
+            # tie-break, so it can differ from CPU for dtypes whose sample inputs
+            # contain duplicates. Values-only correctness is covered by the
+            # dedicated test_mode in test_mps.py.
+            "mode": [
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
                 torch.uint8,
                 torch.bool,
                 torch.float16,

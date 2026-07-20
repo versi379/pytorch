@@ -6164,6 +6164,33 @@ class TestMPS(TestCaseMPS):
         helper_dtype_float32(3, 3, 3)
         helper_dtype_float32(1, 1, 1)
 
+    # https://github.com/pytorch/pytorch/issues/141287
+    def test_mode(self):
+        # Generic value/index correctness is covered by the mode OpInfo
+        # consistency test (float32 matches CPU exactly). This only covers what
+        # OpInfo cannot: the smallest-value tie-break contract, and the integer
+        # and bool paths, which OpInfo xfails on MPS because a repeated mode
+        # value's index depends on the sort tie order and need not match CPU.
+        # For those we assert the value matches CPU and the index gathers to it.
+        def check_valid(mps_x, dim, keepdim):
+            cpu_v, _ = torch.mode(mps_x.cpu(), dim=dim, keepdim=keepdim)
+            mps_v, mps_i = torch.mode(mps_x, dim=dim, keepdim=keepdim)
+            self.assertEqual(cpu_v, mps_v.cpu())
+            gidx = mps_i if keepdim else mps_i.unsqueeze(dim)
+            gathered = mps_x.gather(dim, gidx)
+            self.assertEqual(gathered if keepdim else gathered.squeeze(dim), mps_v)
+
+        for keepdim in [False, True]:
+            check_valid(torch.tensor([[1, 2, 2, 3], [4, 4, 5, 5], [7, 7, 7, 8]],
+                                     dtype=torch.int64, device="mps"), 1, keepdim)
+            check_valid(torch.tensor([[True, False, True], [False, False, True]],
+                                     device="mps"), 1, keepdim)
+
+        # Tie-break: with equal frequencies the smallest value wins (strict >),
+        # matching CPU's mode_kernel_impl.
+        tie = torch.tensor([3, 3, 1, 1, 2], dtype=torch.int64, device="mps")
+        self.assertEqual(torch.mode(tie).values.item(), 1)
+
     @parametrize("dtype", [torch.float32, torch.bfloat16, torch.int32, torch.int64])
     @parametrize("op", ["median", "nanmedian"])
     def test_median_comprehensive(self, dtype, op):
