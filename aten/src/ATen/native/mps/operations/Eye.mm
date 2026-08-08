@@ -42,7 +42,6 @@ Tensor& eye_out_mps(int64_t n, int64_t m, Tensor& result) {
 
   if (n * m <= kSinglePassThreshold) {
     auto key = "eye_" + scalarToMetalTypeString(result);
-    id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
     id<MTLComputePipelineState> pso = lib.getPipelineStateForFunc(key);
 
     // Map x to the smaller stride for coalesced writes
@@ -52,8 +51,13 @@ Tensor& eye_out_mps(int64_t n, int64_t m, Tensor& result) {
     auto grid_x = swap ? static_cast<NSUInteger>(n) : static_cast<NSUInteger>(m);
     auto grid_y = swap ? static_cast<NSUInteger>(m) : static_cast<NSUInteger>(n);
 
+    // commandEncoder() MUST be called inside the dispatch_sync block. Calling it
+    // off-queue lets another thread end/replace the encoder between the call and
+    // the dispatch_sync, leaving a dangling encoder pointer. See MPS thread-safety
+    // contract in MPSStream.h.
     dispatch_sync(mpsStream->queue(), ^() {
       @autoreleasepool {
+        id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
         [computeEncoder setComputePipelineState:pso];
         mtl_setArgs(computeEncoder, result, y_stride, x_stride);
 
@@ -69,11 +73,12 @@ Tensor& eye_out_mps(int64_t n, int64_t m, Tensor& result) {
     int64_t sz = std::min(n, m);
     int64_t diag_stride = stride0 + stride1;
     auto key = "eye_diag_" + scalarToMetalTypeString(result);
-    id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
     id<MTLComputePipelineState> pso = lib.getPipelineStateForFunc(key);
 
+    // See note above: commandEncoder() must be inside the dispatch_sync block.
     dispatch_sync(mpsStream->queue(), ^() {
       @autoreleasepool {
+        id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
         [computeEncoder setComputePipelineState:pso];
         mtl_setArgs(computeEncoder, result, diag_stride);
         mtl_dispatch1DJob(computeEncoder, pso, sz);

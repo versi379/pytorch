@@ -40,14 +40,18 @@ void renorm_out_mps(const Tensor& self, const Scalar& p, int64_t dim, const Scal
 
   std::string key = "renorm_" + scalarToMetalTypeString(self);
   MPSStream* mpsStream = getCurrentMPSStream();
-  id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
   id<MTLComputePipelineState> renormPSO = lib.getPipelineStateForFunc(key);
 
+  // commandEncoder() MUST be called inside the dispatch_sync block. Calling it
+  // off-queue lets another thread end/replace the encoder between the call and
+  // the dispatch_sync, leaving a dangling encoder pointer. See MPS thread-safety
+  // contract in MPSStream.h.
   dispatch_sync(mpsStream->queue(), ^() {
     @autoreleasepool {
       // this function call is a no-op if MPSProfiler is not enabled
       getMPSProfiler().beginProfileKernel(renormPSO, key, {norm}, mpsStream);
 
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
       [computeEncoder setComputePipelineState:renormPSO];
       mtl_setArgs(computeEncoder, norm, factor, maxnorm.to<float>());
       mtl_dispatch1DJob(computeEncoder, renormPSO, norm.numel());
