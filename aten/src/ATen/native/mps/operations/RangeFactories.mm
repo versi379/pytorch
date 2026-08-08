@@ -31,10 +31,13 @@ void arange_range_fill_mps(const Scalar& start, const Scalar& step, Tensor& resu
   const auto tname = scalarToMetalTypeString(result);
   const bool is_int = isIntegralType(result.scalar_type(), /*includeBool=*/false);
   auto stream = getCurrentMPSStream();
-  auto encoder = stream->commandEncoder();
 
   // Binds result and {start, step}: int64 for integer dtypes, float otherwise.
-  const auto bind_start_step = [&] {
+  // Takes the encoder as an argument because commandEncoder() MUST be called
+  // inside the dispatch_sync block: calling it off-queue lets another thread
+  // end/replace the encoder between the call and the dispatch_sync, leaving a
+  // dangling encoder pointer. See MPS thread-safety contract in MPSStream.h.
+  const auto bind_start_step = [&](id<MTLComputeCommandEncoder> encoder) {
     if (is_int) {
       mtl_setArgs(encoder, result, std::array<int64_t, 2>{start.to<int64_t>(), step.to<int64_t>()});
     } else {
@@ -49,8 +52,9 @@ void arange_range_fill_mps(const Scalar& start, const Scalar& step, Tensor& resu
     auto pso = lib.getPipelineStateForFunc("arange_" + tname + (use32 ? "_i32" : "_i64"));
     dispatch_sync_with_rethrow(stream->queue(), ^() {
       @autoreleasepool {
+        auto encoder = stream->commandEncoder();
         [encoder setComputePipelineState:pso];
-        bind_start_step();
+        bind_start_step(encoder);
         if (use32) {
           mtl_setArgs<2>(encoder, static_cast<int32_t>(stride));
         } else {
@@ -67,8 +71,9 @@ void arange_range_fill_mps(const Scalar& start, const Scalar& step, Tensor& resu
     const std::vector<int64_t> strides(result.strides().rbegin(), result.strides().rend());
     dispatch_sync_with_rethrow(stream->queue(), ^() {
       @autoreleasepool {
+        auto encoder = stream->commandEncoder();
         [encoder setComputePipelineState:pso];
-        bind_start_step();
+        bind_start_step(encoder);
         mtl_setArgs<2>(encoder, ndim, sizes, strides);
         mtl_dispatch1DJob(encoder, pso, static_cast<NSUInteger>(steps));
       }
@@ -200,7 +205,6 @@ Tensor& linspace_out_mps(const Scalar& start, const Scalar& end, int64_t steps, 
   }
 
   auto stream = getCurrentMPSStream();
-  auto encoder = stream->commandEncoder();
   const auto tname = scalarToMetalTypeString(result);
   const auto kernel_prefix = use_integral_kernel ? "linspace_integral_" : "linspace_";
 
@@ -209,8 +213,10 @@ Tensor& linspace_out_mps(const Scalar& start, const Scalar& end, int64_t steps, 
     const auto abs_stride = stride < 0 ? -stride : stride;
     const auto use32 = std::max<int64_t>(steps, (steps - 1) * abs_stride) <= std::numeric_limits<int32_t>::max();
     auto pso = lib.getPipelineStateForFunc(kernel_prefix + tname + (use32 ? "_i32" : "_i64"));
+    // See note in arange_range_fill_mps: commandEncoder() must be inside the block.
     dispatch_sync_with_rethrow(stream->queue(), ^() {
       @autoreleasepool {
+        auto encoder = stream->commandEncoder();
         [encoder setComputePipelineState:pso];
         if (use32) {
           std::array<int32_t, 2> p{int32_t(steps), int32_t(stride)};
@@ -240,6 +246,7 @@ Tensor& linspace_out_mps(const Scalar& start, const Scalar& end, int64_t steps, 
     const auto steps32 = static_cast<uint32_t>(steps);
     dispatch_sync_with_rethrow(stream->queue(), ^() {
       @autoreleasepool {
+        auto encoder = stream->commandEncoder();
         [encoder setComputePipelineState:pso];
         if (use_integral_kernel) {
           mtl_setArgs(encoder, result, integral_params, steps32, ndim, sizes, strides);
