@@ -192,7 +192,13 @@ GemvLaunch prepare_gemv_launch(c10::ScalarType dt,
           at::ceil_div(outlen, rows_per_tg)};
 }
 
-void encode_gemv_launch(at::mps::MPSStream* stream,
+// Takes the encoder as an argument because commandEncoder() MUST be called
+// inside the dispatch_sync block: calling it off-queue lets another thread
+// end/replace the encoder between the call and the dispatch_sync, leaving a
+// dangling encoder pointer. See MPS thread-safety contract in MPSStream.h.
+// stream is still needed alongside enc for the profiler begin/end calls.
+void encode_gemv_launch(id<MTLComputeCommandEncoder> enc,
+                        at::mps::MPSStream* stream,
                         const GemvLaunch& launch,
                         const Tensor& mat,
                         const Tensor& vec,
@@ -201,7 +207,6 @@ void encode_gemv_launch(at::mps::MPSStream* stream,
                         const Tensor& bias,
                         const std::array<float, 2>& alpha_beta) {
   getMPSProfiler().beginProfileKernel(launch.pso, "gemm_gemv/" + launch.kernel, {mat, vec}, stream);
-  auto enc = stream->commandEncoder();
   [enc setComputePipelineState:launch.pso];
   mtl_setArgs(enc, mat, vec, out, dims, bias, alpha_beta);
   [enc dispatchThreadgroups:MTLSizeMake(launch.num_groups, 1, 1)
@@ -279,7 +284,8 @@ void dispatch_gemv(const Tensor& A,
       prepare_gemv_launch(dt, config, epi, gemv_use_t, matrix_contiguous, idx64, outlen, vec_xs, vec_offset);
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      encode_gemv_launch(stream, launch, matrix.tensor, vvec, out, dims, expanded_bias, alpha_beta);
+      auto enc = stream->commandEncoder();
+      encode_gemv_launch(enc, stream, launch, matrix.tensor, vvec, out, dims, expanded_bias, alpha_beta);
     }
   });
 }
