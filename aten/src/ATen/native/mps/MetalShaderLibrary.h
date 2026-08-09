@@ -21,6 +21,7 @@ typedef void* MTLBuffer_t;
 #include <c10/core/Scalar.h>
 #include <c10/util/OptionalArrayRef.h>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <type_traits>
 #include <unordered_map>
@@ -222,6 +223,12 @@ class MetalShaderLibrary {
   std::string shaderSource;
   unsigned nparams;
   MTLCompileOptions* compile_options;
+  // Guards libMap, cplMap, kernelCache, functionNames and functionNamesPopulated.
+  // Recursive because the cache accessors nest: getCachedKernelFunctionPtr ->
+  // getLibraryPipelineState, and hasFunction -> getFunctionNames -> getLibrary.
+  // Held across library compilation and pipeline-state creation, which also
+  // collapses duplicate compilation of the same kernel.
+  std::recursive_mutex cacheMutex;
   std::unordered_map<std::string, MTLLibrary_t> libMap;
   std::unordered_map<
       std::string,

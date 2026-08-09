@@ -759,6 +759,7 @@ MetalShaderLibrary::~MetalShaderLibrary() {
 }
 
 id<MTLLibrary> MetalShaderLibrary::getLibrary() {
+  std::lock_guard<std::recursive_mutex> lock(cacheMutex);
   if (C10_UNLIKELY(!library)) {
     TORCH_INTERNAL_ASSERT(nparams == 0);
     library = compileLibrary(shaderSource);
@@ -803,6 +804,7 @@ id<MTLLibrary> MetalShaderLibrary::getLibrary(const std::initializer_list<std::s
 }
 
 id<MTLLibrary> MetalShaderLibrary::compileLibrary(const std::string& src) {
+  std::lock_guard<std::recursive_mutex> lock(cacheMutex);
   static auto fast_math = []() {
     auto const val = c10::utils::get_env("PYTORCH_MPS_FAST_MATH");
     return val.has_value() && val != "0";
@@ -846,6 +848,7 @@ id<MTLLibrary> MetalShaderLibrary::compileLibrary(const std::string& src) {
 std::pair<id<MTLComputePipelineState>, id<MTLFunction>> MetalShaderLibrary::getLibraryPipelineState(
     id<MTLLibrary> lib,
     const std::string& fname) {
+  std::lock_guard<std::recursive_mutex> lock(cacheMutex);
   auto key = fmt::format("{}:{}", reinterpret_cast<void*>(lib), fname);
   auto found_cpl = cplMap.find(key);
   if (found_cpl != cplMap.end()) {
@@ -862,6 +865,7 @@ std::pair<id<MTLComputePipelineState>, id<MTLFunction>> MetalShaderLibrary::getL
 }
 
 bool MetalShaderLibrary::hasFunction(const std::string& fname) {
+  std::lock_guard<std::recursive_mutex> lock(cacheMutex);
   // Lazily build a set of all kernel names exposed by the library. The library is immutable post-load, so the set is
   // computed once per library instance. Used by exec_unary_kernel to decide whether to take the direct per-(in,out)
   // kernel or fall back to the `_dense_cast_` cast variant.
@@ -894,6 +898,7 @@ std::shared_ptr<MetalKernelFunction> MetalShaderLibrary::getKernelFunction(const
 }
 
 MetalKernelFunction* MetalShaderLibrary::getCachedKernelFunctionPtr(const std::string& name) {
+  std::lock_guard<std::recursive_mutex> lock(cacheMutex);
   // Check if kernel is already cached
   auto it = kernelCache.find(name);
   if (it != kernelCache.end()) {
