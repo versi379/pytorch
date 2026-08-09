@@ -768,6 +768,7 @@ id<MTLLibrary> MetalShaderLibrary::getLibrary() {
 }
 
 id<MTLLibrary> MetalShaderLibrary::getLibrary(const std::initializer_list<std::string>& params) {
+  std::lock_guard<std::recursive_mutex> lock(cacheMutex);
   TORCH_INTERNAL_ASSERT(nparams == params.size());
   std::string key;
   for (const auto& p : params) {
