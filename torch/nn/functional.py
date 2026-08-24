@@ -7147,8 +7147,11 @@ def grouped_mm(
     allows jagged token counts per expert, which is common in Mixture-of-Experts
     (MoE) layers. Both ``mat_a`` and ``mat_b`` must be 2D or 3D tensors that already
     satisfy the physical layout restrictions of grouped GEMM kernels (e.g., row-major
-    ``mat_a`` and column-major ``mat_b`` for FP8 inputs). Inputs are currently
-    expected to be ``torch.bfloat16`` values on CUDA devices with :math:`SM \ge 80`.
+    ``mat_a`` and column-major ``mat_b`` for FP8 inputs). Inputs may be
+    ``torch.float32``, ``torch.bfloat16`` or ``torch.float16``, and both operands must
+    have the same dtype. Fused kernels are only selected for some dtype and hardware
+    combinations (on CUDA, ``torch.bfloat16`` with :math:`SM \ge 90`); everything else
+    falls back to one matrix multiply per group, which is correct but slower.
 
     Args:
         mat_a: Left operand. When 2D, its leading dimension is sliced into groups

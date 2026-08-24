@@ -5,6 +5,7 @@ import torch
 import torch.autograd.forward_ad as fwAD
 import torch.nn.functional as F
 import numpy as np
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 import unittest
 import itertools
@@ -7002,6 +7003,34 @@ scipy_lobpcg  | {eq_err_scipy:10.2e}  | {eq_err_general_scipy:10.2e}  | {iters2:
             out_ref = torch.mm(a_slice, b_slice.t())
             self.assertEqual(out[i], out_ref)
             start = offs[i]
+
+    @onlyNativeDeviceTypes
+    @dtypes(torch.float32, torch.bfloat16, torch.float16)
+    def test_grouped_mm_meta_accepts_eager_dtypes(self, device, dtype):
+        # _grouped_mm_validate_inputs() accepts fp32/bf16/fp16 on every backend, so
+        # tracing must accept them too. The meta function used to reject fp32
+        # outright and gate fp16 on cuBLASLt being available, which made
+        # torch.compile fail on inputs eager runs fine.
+        m, k, n, n_groups = 32, 16, 16, 4
+        a = torch.randn(m, k, device=device, dtype=dtype)
+        b = torch.randn(n_groups, k, n, device=device, dtype=dtype)
+        offs = torch.arange(1, n_groups + 1, device=device, dtype=torch.int32) * (m // n_groups)
+
+        expected = torch._grouped_mm(a, b, offs=offs)
+
+        with FakeTensorMode():
+            fake = torch._grouped_mm(
+                torch.empty(m, k, device=device, dtype=dtype),
+                torch.empty(n_groups, k, n, device=device, dtype=dtype),
+                offs=torch.empty(n_groups, device=device, dtype=torch.int32),
+            )
+        self.assertEqual(expected.shape, fake.shape)
+        self.assertEqual(expected.dtype, fake.dtype)
+
+        compiled = torch.compile(
+            lambda x, y, o: torch._grouped_mm(x, y, offs=o), fullgraph=True
+        )(a, b, offs)
+        self.assertEqual(expected, compiled)
 
     @unittest.skipIf(IS_WINDOWS, "Skipped on Windows!")
     @unittest.skipIf(IS_FBCODE and IS_REMOTE_GPU, "cublas runtime error")
