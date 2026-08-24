@@ -8567,11 +8567,18 @@ def _create_grouped_mm_output_tensor(mat1, mat2, offs, out_dtype):
 
     out_dtype = out_dtype or mat1.dtype
 
-    if torch.version.cuda:
+    # Mirror compute_grouped_gemm_output_size_stride() in
+    # aten/src/ATen/native/GroupedMMUtils.h, which pads the last dim for TMA
+    # alignment on every build except ROCm. Keying this on CUDA instead would
+    # give meta unpadded strides on CPU/MPS builds while eager returns padded
+    # ones, so the meta output would not match the real one.
+    if not torch.version.hip:
         alignment = 16 // out_dtype.itemsize
         size_padded = (out_size[-1] + alignment - 1) // alignment * alignment
         if mat1_is_2d == mat2_is_2d:
-            out_stride = [out_size[1] * size_padded, size_padded, 1]
+            # c10::contiguous_strides clamps each size to at least 1, so a
+            # zero-length dim still advances the outer stride.
+            out_stride = [max(out_size[1], 1) * size_padded, size_padded, 1]
         else:
             out_stride = [size_padded, 1]
         out = torch.empty_strided(

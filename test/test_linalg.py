@@ -5,6 +5,7 @@ import torch
 import torch.autograd.forward_ad as fwAD
 import torch.nn.functional as F
 import numpy as np
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 import unittest
 import itertools
@@ -7002,6 +7003,44 @@ scipy_lobpcg  | {eq_err_scipy:10.2e}  | {eq_err_general_scipy:10.2e}  | {iters2:
             out_ref = torch.mm(a_slice, b_slice.t())
             self.assertEqual(out[i], out_ref)
             start = offs[i]
+
+    @onlyNativeDeviceTypes
+    @dtypes(torch.bfloat16)
+    @parametrize("layout", ["2d3d", "2d2d_empty"])
+    def test_grouped_mm_meta_stride_matches_eager(self, device, dtype, layout):
+        # The eager kernel pads the output's last dim for TMA alignment on every
+        # build except ROCm, so the meta function has to pad on the same builds or
+        # a traced graph plans against strides the real op will not produce. Only a
+        # non-CUDA build exercises this: where torch.version.cuda is truthy both
+        # paths padded already.
+        #
+        # 2d3d gives a 2-D output; n = 10 is deliberately not a multiple of the
+        # 8-element bf16 alignment, and mat_b is transposed so its last-dim stride
+        # rather than n carries the alignment requirement, which is what lets n
+        # itself be unaligned. 2d2d_empty gives a 3-D (groups, m, n) output with an
+        # empty middle dim, covering the separate stride formula for that shape,
+        # where the eager side clamps each size to 1 while building strides.
+        k, n_groups = 16, 4
+
+        def make(fn):
+            if layout == "2d3d":
+                n = 10
+                a = fn(32, k)
+                b = fn(n_groups, n, k).transpose(-2, -1)
+                offs = torch.arange(1, n_groups + 1, device=device, dtype=torch.int32) * 8
+            else:
+                a = fn(0, k * n_groups)
+                b = fn(k * n_groups, 32)
+                offs = torch.arange(1, n_groups + 1, device=device, dtype=torch.int32) * k
+            return a, b, offs
+
+        real = torch._grouped_mm(*make(lambda *s: torch.randn(*s, device=device, dtype=dtype)))
+
+        with FakeTensorMode():
+            fake = torch._grouped_mm(*make(lambda *s: torch.empty(*s, device=device, dtype=dtype)))
+
+        self.assertEqual(real.shape, fake.shape)
+        self.assertEqual(real.stride(), fake.stride())
 
     @unittest.skipIf(IS_WINDOWS, "Skipped on Windows!")
     @unittest.skipIf(IS_FBCODE and IS_REMOTE_GPU, "cublas runtime error")
