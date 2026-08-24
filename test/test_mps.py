@@ -932,6 +932,29 @@ class TestMPS(TestCaseMPS):
         kl_div = F.kl_div(q.log(), p, reduction='sum').item()
         self.assertLess(kl_div, 0.03)
 
+    # Keep in sync with MacOSVersion in aten/src/ATen/mps/MPSDevice.h.
+    @parametrize("version", [(14, 0), (14, 4), (15, 0), (15, 1), (15, 2), (26, 0), (26, 2), (26, 4), (27, 0)])
+    def test_is_macos_or_newer_matches_running_version(self, version):
+        # An unmapped minor used to fall through to the nearest lower version's
+        # answer, so a query could be wrong in either direction.
+        major, minor = version
+        expected = MACOS_VERSION >= float(f"{major}.{minor}")
+        torch.backends.mps.is_macos_or_newer.cache_clear()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            actual = torch.backends.mps.is_macos_or_newer(major, minor)
+        self.assertEqual(actual, expected, f"is_macos_or_newer({major}, {minor})")
+        unmapped = [str(w.message) for w in caught
+                    if "Can't check" in str(w.message) or "unexpected MacOS" in str(w.message)]
+        self.assertEqual(unmapped, [], f"{major}.{minor} is in MacOSVersion but was not mapped")
+
+    def test_is_macos_or_newer_below_supported_floor(self):
+        # MPS requires macOS 14.0, so a lower bound under that is always met.
+        # These used to fall through the switch and report false.
+        for major in (11, 12, 13):
+            torch.backends.mps.is_macos_or_newer.cache_clear()
+            self.assertTrue(torch.backends.mps.is_macos_or_newer(major, 0), f"{major}.0")
+
     def test_stream_base(self):
         s1 = torch._C._MPSStreamBase()
         s2 = torch._C._MPSStreamBase()

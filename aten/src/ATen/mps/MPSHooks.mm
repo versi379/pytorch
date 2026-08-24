@@ -22,13 +22,25 @@ bool MPSHooks::hasMPS() const {
 
 bool MPSHooks::isOnMacOSorNewer(unsigned major, unsigned minor) const {
   switch (major) {
+    case 27:
+      switch (minor) {
+        case 0:
+          return is_macos_at_least(MacOSVersion::MACOS_27_0);
+        default:
+          TORCH_WARN("Can't check whether running on 27.", minor, "+ returning one for 27.0+");
+          return is_macos_at_least(MacOSVersion::MACOS_27_0);
+      }
     case 26:
       switch (minor) {
         case 0:
           return is_macos_at_least(MacOSVersion::MACOS_26_0);
+        case 2:
+          return is_macos_at_least(MacOSVersion::MACOS_26_2);
+        case 4:
+          return is_macos_at_least(MacOSVersion::MACOS_26_4);
         default:
-          TORCH_WARN("Can't check whether running on 26.", minor, "+ returning one for 26.0+");
-          return is_macos_at_least(MacOSVersion::MACOS_26_0);
+          TORCH_WARN("Can't check whether running on 26.", minor, "+ returning one for 26.4+");
+          return is_macos_at_least(MacOSVersion::MACOS_26_4);
       }
     case 15:
       switch (minor) {
@@ -36,9 +48,11 @@ bool MPSHooks::isOnMacOSorNewer(unsigned major, unsigned minor) const {
           return is_macos_at_least(MacOSVersion::MACOS_15_0);
         case 1:
           return is_macos_at_least(MacOSVersion::MACOS_15_1);
+        case 2:
+          return is_macos_at_least(MacOSVersion::MACOS_15_2);
         default:
-          TORCH_WARN("Can't check whether running on 15.", minor, "+ returning one for 15.1+");
-          return is_macos_at_least(MacOSVersion::MACOS_15_1);
+          TORCH_WARN("Can't check whether running on 15.", minor, "+ returning one for 15.2+");
+          return is_macos_at_least(MacOSVersion::MACOS_15_2);
       }
     case 14:
       switch (minor) {
@@ -53,6 +67,10 @@ bool MPSHooks::isOnMacOSorNewer(unsigned major, unsigned minor) const {
     case 13:
       return true;
     default:
+      // MPS requires macOS 14.0, so any lower bound below that is already met.
+      if (major < 14) {
+        return true;
+      }
       TORCH_WARN("Checking for unexpected MacOS ", major, ".", minor, " returning false");
       return false;
   }
