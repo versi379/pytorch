@@ -3051,10 +3051,19 @@ kernel void svd_jacobi(
           }
         }
       }
-      threadgroup_barrier(
-          params.stage_v
-              ? mem_flags::mem_threadgroup
-              : (mem_flags::mem_threadgroup | mem_flags::mem_device));
+      // A non-constant flags argument here (a runtime ternary on
+      // params.stage_v) has been reported to leave the barrier's memory scope
+      // incorrectly established on some Apple Silicon GPUs (#192802),
+      // corrupting the rotation accumulator on the next sweep. params.stage_v
+      // comes from a constant buffer, so it is uniform across every thread in
+      // the dispatch; splitting into two constant-flag calls changes nothing
+      // about which threads take which branch, only that each call site's flags
+      // argument is now a compile-time constant.
+      if (params.stage_v) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+      }
     }
 
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);

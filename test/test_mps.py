@@ -12071,6 +12071,17 @@ class TestConv3dChannelsLast3dMPS(NNTestCase):
 
 
 class TestLinalgMPS(TestCaseMPS):
+    # https://github.com/pytorch/pytorch/issues/192802
+    def test_svd_batched_small_shapes(self):
+        # These shapes are small enough (batch*m*n < 8192) to route through the
+        # Metal Jacobi kernel rather than falling back to MPSGraph/CPU.
+        for shape in [(32, 32, 32), (2, 64, 64), (8, 32, 32), (16, 16, 16)]:
+            batch, m, n = shape
+            a = torch.randn(batch, m, n, device="mps")
+            u, s, vh = torch.linalg.svd(a, full_matrices=False)
+            recon = u @ torch.diag_embed(s).to(u.dtype) @ vh
+            self.assertEqual(recon, a, atol=1e-4, rtol=1e-4)
+
     def test__int_mm(self):
         torch.manual_seed(0)
 
