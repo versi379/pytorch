@@ -631,6 +631,7 @@
 # /test/metal/
 # /test/test_metal.py
 /test/test_mps.py @malfet
+/test/test_mps_threading.py @malfet
 # /torch/backends/mps/
 # /torch/csrc/mps/
 # /torch/mps/

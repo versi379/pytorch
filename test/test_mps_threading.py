@@ -1,3 +1,4 @@
+# Owner(s): ["module: mps"]
 """
 Threading regression tests for the MPS backend.
 
@@ -11,6 +12,7 @@ After the lockdown they should run cleanly for the full duration.
 Run only on MPS:
   pytest test/test_mps_threading.py -v -s
 """
+
 import os
 import threading
 import time
@@ -18,12 +20,11 @@ import unittest
 
 import torch
 import torch.utils.cpp_extension
+from torch.testing._internal.common_utils import run_tests, TestCase
 
 
-@unittest.skipUnless(
-    torch.backends.mps.is_available(), "MPS backend not available"
-)
-class TestMPSThreading(unittest.TestCase):
+@unittest.skipUnless(torch.backends.mps.is_available(), "MPS backend not available")
+class TestMPSThreading(TestCase):
     # Each test runs for SOAK_SECONDS. Override with env var for longer runs.
     SOAK_SECONDS = float(os.environ.get("MPS_SOAK_SECONDS", "10"))
 
@@ -47,7 +48,7 @@ class TestMPSThreading(unittest.TestCase):
                 try:
                     while not stop.is_set():
                         fn()
-                except BaseException as e:  # noqa: BLE001
+                except BaseException as e:
                     errors.append(e)
                     stop.set()
 
@@ -84,7 +85,8 @@ class TestMPSThreading(unittest.TestCase):
 
         def worker_matmul():
             y = (x @ w).sum().item()
-            assert isinstance(y, float)
+            if not isinstance(y, float):
+                raise AssertionError(f"expected float, got {type(y)}")
 
         def worker_sync():
             torch.mps.synchronize()
@@ -139,9 +141,7 @@ class TestMPSThreading(unittest.TestCase):
             with torch.no_grad():
                 _ = net(x).cpu()
 
-        self._run_threads(
-            [worker_train, worker_render], self.SOAK_SECONDS
-        )
+        self._run_threads([worker_train, worker_render], self.SOAK_SECONDS)
 
     def test_single_thread_synchronize_interleaved_with_ops(self):
         """Smoke: interleaving MPS ops with explicit synchronize() must not crash or hang.
@@ -151,7 +151,8 @@ class TestMPSThreading(unittest.TestCase):
         """
         x = torch.randn(64, 64, device="mps")
         w = torch.randn(64, 64, device="mps")
-        assert x.device.type == "mps", "test requires MPS-backed tensors"
+        if x.device.type != "mps":
+            raise AssertionError("test requires MPS-backed tensors")
         deadline = time.time() + min(2.0, self.SOAK_SECONDS)
         while time.time() < deadline:
             for _ in range(50):
@@ -181,6 +182,7 @@ class TestMPSThreading(unittest.TestCase):
         so no other thread can interleave between capture and use; the test
         must run cleanly for SOAK_SECONDS.
         """
+
         def worker_eye():
             for _ in range(8):
                 _ = torch.eye(100, 100, device="mps")
@@ -197,8 +199,14 @@ class TestMPSThreading(unittest.TestCase):
             _ = c.sum().item()
 
         self._run_threads(
-            [worker_eye, worker_sync, worker_eye, worker_sync,
-             worker_matmul, worker_matmul],
+            [
+                worker_eye,
+                worker_sync,
+                worker_eye,
+                worker_sync,
+                worker_matmul,
+                worker_matmul,
+            ],
             self.SOAK_SECONDS,
         )
 
@@ -225,4 +233,4 @@ class TestMPSThreading(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    run_tests()
