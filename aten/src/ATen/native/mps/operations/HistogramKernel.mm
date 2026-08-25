@@ -12,6 +12,7 @@
 #include <ATen/ops/sum.h>
 #endif
 #include <c10/util/irange.h>
+#include <algorithm>
 
 namespace at::native {
 namespace mps {
@@ -65,9 +66,15 @@ void histogramdd_kernel_impl(Tensor& hist_output,
   size_t bin_seq_offset = 0;
 
   for (const auto dim : c10::irange(D)) {
-    for (const auto elem_idx : c10::irange(bin_edges[dim].numel())) {
-      bin_seq[bin_seq_offset + elem_idx] = (bin_edges[dim][elem_idx].item().to<input_t>());
-    }
+    // Copy each dim's edges to the host once. Reading them element-wise with
+    // .item() costs a full CPU-GPU sync per bin edge, which made histc() scale
+    // with bin count rather than input size (~160 ms at bins=1000).
+    const auto edges_cpu =
+        bin_edges[dim]
+            .to(bin_edges[dim].options().device(kCPU).dtype(c10::CppTypeToScalarType<input_t>::value))
+            .contiguous();
+    const auto* edges_ptr = edges_cpu.template const_data_ptr<input_t>();
+    std::copy(edges_ptr, edges_ptr + edges_cpu.numel(), bin_seq.begin() + bin_seq_offset);
     num_bin_edges[dim] = bin_edges[dim].numel();
     leftmost_edge[dim] = bin_seq[bin_seq_offset];
     rightmost_edge[dim] = bin_seq[bin_seq_offset + num_bin_edges[dim] - 1];

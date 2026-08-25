@@ -932,6 +932,22 @@ class TestMPS(TestCaseMPS):
         kl_div = F.kl_div(q.log(), p, reduction='sum').item()
         self.assertLess(kl_div, 0.03)
 
+    def test_histc_bin_edges_match_cpu(self):
+        # The bin edges used to be read back one element at a time with .item(),
+        # costing a CPU-GPU sync per edge, so cost scaled with bin count rather
+        # than input size. bins=1000 is here to keep that path honest.
+        for dtype in [torch.float32, torch.float16, torch.bfloat16]:
+            x = torch.randn(4096, dtype=dtype)
+            for bins in [10, 1000]:
+                self.assertEqual(torch.histc(x.to("mps"), bins=bins, min=-3, max=3).cpu(),
+                                 torch.histc(x, bins=bins, min=-3, max=3))
+
+    def test_histogramdd_matches_cpu(self):
+        # Multi-dim exercises the per-dim edge copy with D > 1.
+        x = torch.randn(512, 2)
+        self.assertEqual(torch.histogramdd(x.to("mps"), bins=[7, 5])[0].cpu(),
+                         torch.histogramdd(x, bins=[7, 5])[0])
+
     def test_stream_base(self):
         s1 = torch._C._MPSStreamBase()
         s2 = torch._C._MPSStreamBase()
