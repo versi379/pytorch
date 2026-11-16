@@ -157,6 +157,13 @@ class TcclTestBase(TestCase):
 
     timeout = timedelta(seconds=120)
 
+    # One rendezvous port per class (crc32 of the name, the same on every rank):
+    # a shared port raced the next class's connect against the old listener.
+    @classmethod
+    def _class_port(cls, base_port):
+        import zlib
+        return base_port + (zlib.crc32(cls.__name__.encode()) % 1000)
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -173,8 +180,8 @@ class TcclTestBase(TestCase):
         cls.rank, cls.world_size, master_addr, master_port = env
         cls.device = torch.device("mps", 0)  # one MPS device per machine (not mps:rank)
         store = c10d.TCPStore(
-            host_name=master_addr, port=master_port, world_size=cls.world_size,
-            is_master=(cls.rank == 0), timeout=cls.timeout)
+            host_name=master_addr, port=cls._class_port(master_port),
+            world_size=cls.world_size, is_master=(cls.rank == 0), timeout=cls.timeout)
         c10d.init_process_group(
             backend="tccl", store=store, rank=cls.rank, world_size=cls.world_size,
             device_id=cls.device, timeout=cls.timeout)
