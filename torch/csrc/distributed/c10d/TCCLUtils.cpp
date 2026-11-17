@@ -37,8 +37,7 @@ static_assert(
 
 namespace {
 
-constexpr const char* kInitCounterKey = "tccl_init_counter";
-constexpr const char* kInitSeqBroadcastKey = "tccl_init_seq";
+constexpr const char* kInitCounterKey = "tccl_init_counter_rank";
 constexpr int kQpMaxSendWr = 32;
 constexpr int kQpMaxRecvWr = 32;
 constexpr int kQpMaxSge = 1;
@@ -213,7 +212,8 @@ std::vector<std::string> resolveTcclPeerDevices(
     int rank,
     int size,
     const std::string& explicit_name,
-    bool ring_topology) {
+    bool ring_topology,
+    const std::vector<uint64_t>& global_ranks) {
   TORCH_CHECK_WITH(
       DistBackendError,
       size > 0 && rank >= 0 && rank < size,
@@ -257,9 +257,13 @@ std::vector<std::string> resolveTcclPeerDevices(
       }
       start = comma + 1;
     }
+    // The launcher's row has one field per world rank; a subgroup's ranks are
+    // group-local, so its members' fields are picked by their global ranks.
+    const bool subgroup = static_cast<int>(parts.size()) != size &&
+        static_cast<int>(global_ranks.size()) == size;
     TORCH_CHECK_WITH(
         DistBackendError,
-        static_cast<int>(parts.size()) == size,
+        static_cast<int>(parts.size()) == size || subgroup,
         "TCCL: TCCL_PEER_DEVICES has ",
         parts.size(),
         " comma-separated entries; expected world_size=",
@@ -267,6 +271,26 @@ std::vector<std::string> resolveTcclPeerDevices(
         " (self-slot empty). Value: '",
         s,
         "'.");
+    TORCH_CHECK_WITH(
+        DistBackendError,
+        !subgroup || !ring_topology,
+        "TCCL: subgroups need the full mesh; under TCCL_TOPOLOGY=ring a "
+        "group's neighbors are not the cabled ones.");
+    if (subgroup) {
+      std::vector<std::string> picked(static_cast<size_t>(size));
+      for (int p = 0; p < size; p++) {
+        TORCH_CHECK_WITH(
+            DistBackendError,
+            global_ranks[p] < parts.size(),
+            "TCCL: subgroup member ",
+            global_ranks[p],
+            " is outside TCCL_PEER_DEVICES (",
+            parts.size(),
+            " entries).");
+        picked[static_cast<size_t>(p)] = parts[global_ranks[p]];
+      }
+      parts = std::move(picked);
+    }
     for (int p = 0; p < size; p++) {
       if (isConnectedPeer(p)) {
         TORCH_CHECK_WITH(
@@ -840,23 +864,14 @@ void checkLinkLayer(const std::string& rdma_device) {
 int64_t tcclInitSequence(
     Store& store,
     int rank,
-    std::chrono::milliseconds timeout) {
-  // All ranks must agree on ONE sequence number for this PG instance. Only rank
-  // 0 reserves it (Store::add, a server-side atomic) and broadcasts it; others
-  // read rank 0's value. A per-rank Store::add would hand each caller a
-  // different value, so key prefixes would diverge and ranks never find each
-  // other. Mirrors ProcessGroupNCCL's unique-id broadcast.
-  if (rank == 0) {
-    const int64_t seq = store.add(kInitCounterKey, 1);
-    const std::string s = std::to_string(seq);
-    store.set(kInitSeqBroadcastKey, std::vector<uint8_t>(s.begin(), s.end()));
-    return seq;
-  }
-  // Non-root ranks block here until rank 0 publishes the number. Bound by the
-  // backend timeout instead of the Store's default.
-  StoreTimeoutGuard guard(store, timeout);
-  const std::vector<uint8_t> bytes = store.get(kInitSeqBroadcastKey);
-  return std::stoll(std::string(bytes.begin(), bytes.end()));
+    std::chrono::milliseconds /*timeout*/) {
+  // All ranks must agree on ONE sequence number for this PG instance. Each rank
+  // counts its own creations on this store: every rank creates the group the
+  // same number of times, so the counts agree with no broadcast. A broadcast
+  // key would still hold the previous incarnation's value when a group is
+  // re-created on the same store, and a rank reading it early would join the
+  // wrong one.
+  return store.add(kInitCounterKey + std::to_string(rank), 1);
 }
 
 void allgatherDestinationsViaStore(

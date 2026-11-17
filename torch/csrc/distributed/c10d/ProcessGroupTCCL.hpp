@@ -49,14 +49,7 @@ class TORCH_API ProcessGroupTCCL : public Backend {
     }
 
     // Public completion entry point (the worker lambda calls this).
-    void finishWork(std::exception_ptr exception = nullptr) {
-      if (exception) {
-        future_->setError(exception);
-      } else {
-        future_->markCompleted(c10::IValue(outputs_));
-      }
-      finish(std::move(exception));
-    }
+    void finishWork(std::exception_ptr exception = nullptr);
 
    private:
     const uint64_t seq_;
@@ -191,13 +184,40 @@ class TORCH_API ProcessGroupTCCL : public Backend {
   c10::intrusive_ptr<Work> barrier(
       const BarrierOptions& opts = BarrierOptions()) override;
 
+  // batch_isend_irecv: the sends and recvs issued between start and end run
+  // as one exchange, so a ring shift does not wait on itself.
+  bool supportsCoalescing() const override {
+    return true;
+  }
+  void startCoalescing() override;
+  c10::intrusive_ptr<Work> endCoalescing() override;
+
  protected:
+  struct P2POp {
+    bool isSend;
+    int peer;
+    at::Tensor tensor;
+    c10::intrusive_ptr<TCCLWork> work;
+  };
+
   c10::intrusive_ptr<Store> store_;
   c10::intrusive_ptr<Options> options_;
   // Resolved in ctor from options_ + TCCL_TOPOLOGY
   Topology topology_{Topology::Mesh};
   std::atomic<uint64_t> seq_{0};
   std::atomic<uint64_t> barrierSeq_{0};
+  // Store keys of this incarnation of the group, so a re-created group on the
+  // same store never meets an earlier one's keys.
+  std::string keyPrefix_;
+
+  // Set once a collective has failed: its work requests may still be posted
+  // on the queue pairs, so data-path work is refused from then on.
+  // brokenReason_ is written once, before broken_ is set.
+  std::atomic<bool> broken_{false};
+  std::string brokenReason_;
+
+  bool coalescing_{false};
+  std::vector<P2POp> coalescedOps_;
 
   // One TCCLConnection per (peer_rank, wire) - one UC queue pair each. Index
   // = peer_rank * num_wires + wire. Slots at peer_rank == rank_ stay null.
@@ -222,9 +242,11 @@ class TORCH_API ProcessGroupTCCL : public Backend {
   std::unique_ptr<TCCLEngine> engine_;
 
   // Worker thread model. Spawned at the end of the constructor
-  // (after the RTS barrier) and joined in the destructor.
+  // (after the RTS barrier) and joined in the destructor. A task runs with
+  // run=true; the destructor calls the ones still queued with run=false, so
+  // their Work fails instead of waiting forever.
   std::thread workerThread_;
-  std::deque<std::function<void()>> workQueue_;
+  std::deque<std::function<void(bool run)>> workQueue_;
   std::mutex workMutex_;
   std::condition_variable workCV_;
   std::atomic<bool> stop_{false};
@@ -233,11 +255,13 @@ class TORCH_API ProcessGroupTCCL : public Backend {
   // to flush writes to the inputs, enqueues `fn`, and returns a TCCLWork whose
   // Future completes with `outputs` when `fn` returns. `fn` does the
   // mpsSharedCpuView + engine_ call; `outputs` are what the Future carries (DDP
-  // getFuture() chaining).
-  c10::intrusive_ptr<Work> enqueueCollective(
+  // getFuture() chaining). A dataPath task is refused once the group is
+  // broken; the store-only barrier is not.
+  c10::intrusive_ptr<TCCLWork> enqueueCollective(
       OpType opType,
       std::vector<at::Tensor> outputs,
-      std::function<void()> fn);
+      std::function<void()> fn,
+      bool dataPath = true);
 
   void runLoop();
 };

@@ -289,6 +289,10 @@ TORCH_API std::string resolveTcclDeviceName(const std::string& explicit_name);
 //   2. Fallback - a single device (resolveTcclDeviceName(explicit_name)) for
 //      ALL peers (the single-Thunderbolt-link case).
 //
+// For a subgroup (global_ranks names `size` members of a larger world) the
+// row may instead have one field per world rank and is indexed by each
+// member's global rank; ring topology does not support subgroups.
+//
 // Throws DistBackendError if TCCL_PEER_DEVICES is set but malformed (wrong
 // count, non-empty self-slot, or empty peer slot). Under ring_topology the row
 // is sparse: only the two neighbor slots ((rank+/-1)%size) may be non-empty and
@@ -297,7 +301,8 @@ TORCH_API std::vector<std::string> resolveTcclPeerDevices(
     int rank,
     int size,
     const std::string& explicit_name,
-    bool ring_topology = false);
+    bool ring_topology = false,
+    const std::vector<uint64_t>& global_ranks = {});
 
 // Verify the underlying BSD interface for the requested RDMA device has a
 // non-link-local static IPv4 address. Throws DistBackendError with the exact
@@ -307,8 +312,8 @@ TORCH_API void checkLinkLayer(const std::string& rdma_device);
 // Reserve a unique init sequence number that ALL ranks of this PG instance
 // agree on. Used as a key prefix for destination exchange so PG re-init under
 // the same group_name cannot read stale destinations from a prior incarnation.
-// Only rank 0 reserves (Store::add) and broadcasts; others read it. Returns the
-// agreed counter value (1-indexed).
+// Each rank counts its own creations on the store, which agree because every
+// rank creates the group equally often. Returns that count (1-indexed).
 TORCH_API int64_t
 tcclInitSequence(Store& store, int rank, std::chrono::milliseconds timeout);
 

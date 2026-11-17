@@ -402,6 +402,17 @@ class TCCLEngine {
       const std::vector<std::size_t>& recv_off,
       const std::vector<std::size_t>& recv_bytes);
 
+  // Per-peer exchange, the core of all_to_all and of a batch of p2p ops: sends
+  // send_bytes[p] from send_ptr[p] to and receives recv_bytes[p] into
+  // recv_ptr[p] from every peer at once, so no direction waits on another.
+  // Zero bytes means nothing to or from that peer; the self slot is ignored.
+  void exchange(
+      const std::vector<const char*>& send_ptr,
+      const std::vector<std::size_t>& send_bytes,
+      const std::vector<char*>& recv_ptr,
+      const std::vector<std::size_t>& recv_bytes,
+      const char* what);
+
   // RING all-to-all (neighbours only, store-and-forward), EQUAL splits:
   // send_base holds size_ segments of seg_bytes each (segment j destined for
   // rank j); on exit recv_base holds size_ segments (segment i received from

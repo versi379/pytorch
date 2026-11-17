@@ -1086,16 +1086,12 @@ def _create_tccl_process_group(
             "Distributed package doesn't have TCCL built in. "
             "Rebuild with USE_TCCL=1 on macOS 26.2+ with librdma.dylib."
         )
-    backend_class = ProcessGroupTCCL(
-        opts.store,
-        opts.group_rank,
-        opts.group_size,
-        # pyrefly: ignore [bad-argument-type]
-        timeout=opts.timeout,
-    )
-    backend_class.options.global_ranks_in_group = opts.global_ranks_in_group
-    backend_class.options.group_name = opts.group_id
-    return backend_class
+    # The constructor needs the global ranks to pick a subgroup's devices.
+    # pyrefly: ignore [bad-argument-type]
+    options = ProcessGroupTCCL._Options(opts.timeout)
+    options.global_ranks_in_group = opts.global_ranks_in_group
+    options.group_name = opts.group_id
+    return ProcessGroupTCCL(opts.store, opts.group_rank, opts.group_size, options)
 
 
 def _register_builtin_tccl_backend() -> None:

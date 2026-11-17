@@ -452,23 +452,54 @@ void TCCLEngine::all_reduce(
   }
 
   char* base = reinterpret_cast<char*>(data);
+  const auto send_own = [&](int /*peer*/, std::size_t offset) -> const void* {
+    return base + offset;
+  };
+  const auto from_all = [](int /*peer*/) { return true; };
+  if (size_ == 2) {
+    // x0 + x1 == x1 + x0 bitwise, so arrival order cannot make the ranks differ.
+    mesh_exchange(
+        count * sizeof(T),
+        send_own,
+        from_all,
+        [&](int /*peer*/,
+            const void* recv_ptr,
+            std::size_t offset,
+            std::size_t chunk_bytes) {
+          reduce_op(
+              static_cast<const T*>(recv_ptr),
+              reinterpret_cast<T*>(base + offset),
+              chunk_bytes / sizeof(T));
+        });
+    return;
+  }
+  // From three ranks on, adding peers as they arrive gives each rank its own
+  // rounding, so the chunk is reduced once every peer's piece is in, in rank
+  // order. This rank's own piece is still in its send buffers.
+  const std::size_t own_slot = static_cast<std::size_t>((rank_ + 1) % size_);
+  int arrived = 0;
   mesh_exchange(
       count * sizeof(T),
-      // Send every peer this rank's chunk at `offset`.
-      [&](int /*peer*/, std::size_t offset) -> const void* {
-        return base + offset;
-      },
-      // Receive from every peer.
-      [](int /*peer*/) { return true; },
-      // Reduce the peer's chunk into our output in place.
+      send_own,
+      from_all,
       [&](int /*peer*/,
-          const void* recv_ptr,
+          const void* /*recv_ptr*/,
           std::size_t offset,
           std::size_t chunk_bytes) {
-        reduce_op(
-            static_cast<const T*>(recv_ptr),
-            reinterpret_cast<T*>(base + offset),
-            chunk_bytes / sizeof(T));
+        if (++arrived < size_ - 1) {
+          return;
+        }
+        arrived = 0;
+        const auto piece = [&](int q) {
+          return static_cast<const T*>(
+              q == rank_ ? send_buffers_[own_slot].data()
+                         : recv_buffers_[q].data());
+        };
+        T* out = reinterpret_cast<T*>(base + offset);
+        std::memcpy(out, piece(0), chunk_bytes);
+        for (int q = 1; q < size_; ++q) {
+          reduce_op(piece(q), out, chunk_bytes / sizeof(T));
+        }
       });
 }
 
@@ -1464,7 +1495,25 @@ inline void TCCLEngine::all_to_all(
   if (size_ <= 1) {
     return;
   }
+  std::vector<const char*> send_ptr(size_, nullptr);
+  std::vector<char*> recv_ptr(size_, nullptr);
+  std::vector<std::size_t> to_send(size_, 0), to_recv(size_, 0);
+  for (int p = 0; p < size_; ++p) {
+    if (p == rank_) continue;
+    send_ptr[p] = send_base + send_off[p];
+    recv_ptr[p] = recv_base + recv_off[p];
+    to_send[p] = send_bytes[p];
+    to_recv[p] = recv_bytes[p];
+  }
+  exchange(send_ptr, to_send, recv_ptr, to_recv, "TCCL alltoall(mesh)");
+}
 
+inline void TCCLEngine::exchange(
+    const std::vector<const char*>& send_ptr,
+    const std::vector<std::size_t>& send_bytes,
+    const std::vector<char*>& recv_ptr,
+    const std::vector<std::size_t>& recv_bytes,
+    const char* what) {
   std::vector<std::size_t> s_done(size_, 0), r_done(size_, 0);
   std::vector<std::size_t> s_inflight(size_, 0), r_inflight(size_, 0);
   std::vector<ibv_wc> wcs(8);
@@ -1480,8 +1529,7 @@ inline void TCCLEngine::all_to_all(
     if (p != rank_ && s_inflight[p] == 0 && s_done[p] < send_bytes[p]) {
       s_inflight[p] = std::min(kChunkSize, send_bytes[p] - s_done[p]);
       std::memcpy(
-          send_buffers_[p].data(), send_base + send_off[p] + s_done[p],
-          s_inflight[p]);
+          send_buffers_[p].data(), send_ptr[p] + s_done[p], s_inflight[p]);
       connections_[p]->postSend(
           send_buffers_[p], s_inflight[p], tccl_wr::makeSend(p));
     }
@@ -1515,7 +1563,7 @@ inline void TCCLEngine::all_to_all(
         TORCH_CHECK_WITH(
             DistBackendError,
             wcs[i].status == IBV_WC_SUCCESS,
-            "TCCL alltoall(mesh): WC failed status=",
+            what, ": WC failed status=",
             static_cast<int>(wcs[i].status), " (peer=", p, ").");
         if (tccl_wr::isSend(wcs[i].wr_id)) {
           s_done[p] += s_inflight[p];
@@ -1523,8 +1571,7 @@ inline void TCCLEngine::all_to_all(
           post_send(p);
         } else {
           std::memcpy(
-              recv_base + recv_off[p] + r_done[p],
-              recv_buffers_[p].data(), r_inflight[p]);
+              recv_ptr[p] + r_done[p], recv_buffers_[p].data(), r_inflight[p]);
           r_done[p] += r_inflight[p];
           r_inflight[p] = 0;
           post_recv(p);
@@ -1537,7 +1584,7 @@ inline void TCCLEngine::all_to_all(
       TORCH_CHECK_WITH(
           DistBackendError,
           std::chrono::steady_clock::now() <= deadline,
-          "TCCL alltoall(mesh): timed out after ", timeout().count(),
+          what, ": timed out after ", timeout().count(),
           " ms. The poll bound is the process-group timeout; a persistent stall "
           "indicates a dropped UC packet (no hardware retransmission).");
     }

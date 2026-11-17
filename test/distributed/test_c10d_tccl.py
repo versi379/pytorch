@@ -33,6 +33,8 @@ import contextlib
 import math
 import os
 import sys
+import threading
+import time
 import unittest
 from datetime import timedelta
 
@@ -198,6 +200,7 @@ class TcclTestBase(TestCase):
             is_master=(cls.rank == 0),
             timeout=cls.timeout,
         )
+        cls.store = store
         c10d.init_process_group(
             backend="tccl",
             store=store,
@@ -272,6 +275,68 @@ class ProcessGroupTcclCorrectnessTest(TcclTestBase):
         expected = torch.full_like(t, ws if op == "MAX" else 1)
         expected[:ws] = float("nan")
         self.assertEqual(t, expected, equal_nan=True)
+
+    def test_allreduce_ranks_agree(self):
+        # 1e8 + -1e8 + 1 rounds differently depending on the order the terms are
+        # added in, so ranks that add peers as they arrive end up with different
+        # sums; every rank must hold the same bits.
+        ws = self.world_size
+        if ws < 3:
+            self.skipTest("two ranks add the same two terms")
+        vals = [1e8, -1e8, 1.0] + [0.0] * (ws - 3)
+        for _ in range(20):
+            t = torch.full((1024,), vals[self.rank], device=self.device)
+            c10d.all_reduce(t)
+            out = torch.empty(ws, device=self.device)
+            c10d.all_gather_into_tensor(out, t[:1].contiguous())
+            self.assertEqual(out, out[:1].expand(ws), atol=0, rtol=0)
+
+    def test_barrier_waits_for_queued_work(self):
+        t = torch.ones(1 << 24, device=self.device)
+        work = c10d.all_reduce(t, async_op=True)
+        c10d.barrier()
+        self.assertTrue(work.is_completed())
+        work.wait()
+
+    def test_batch_isend_irecv_ring_shift(self):
+        # The batch_isend_irecv docstring example: every rank sends to the next
+        # and receives from the previous in one batch.
+        ws, r = self.world_size, self.rank
+        send = torch.full((1 << 18,), float(r), device=self.device)
+        recv = torch.zeros(1 << 18, device=self.device)
+        ops = [
+            c10d.P2POp(c10d.isend, send, (r + 1) % ws),
+            c10d.P2POp(c10d.irecv, recv, (r - 1) % ws),
+        ]
+        for work in c10d.batch_isend_irecv(ops):
+            work.wait()
+        self.assertEqual(recv, torch.full_like(recv, float((r - 1) % ws)))
+
+    def test_future_callback_issues_collective(self):
+        # The stock PowerSGD hook issues and waits on a collective from inside a
+        # Future callback.
+        a = torch.ones(1 << 23, device=self.device)
+        b = torch.ones(16, device=self.device)
+        fut = c10d.all_reduce(a, async_op=True).get_future()
+        inner = fut.then(
+            lambda _: c10d.all_reduce(b, async_op=True).get_future().wait()
+        )
+        done = threading.Event()
+        inner.add_done_callback(lambda _: done.set())
+        self.assertTrue(done.wait(60), "the callback's collective never ran")
+        self.assertEqual(b, torch.full_like(b, float(self.world_size)))
+
+    def test_subgroup_allreduce(self):
+        ws = self.world_size
+        if ws < 3 or _ring_topology():
+            self.skipTest("a strict subgroup needs 3+ ranks on the full mesh")
+        members = [0, ws - 1]
+        sub = c10d.new_group(members, backend="tccl", timeout=self.timeout)
+        if self.rank in members:
+            t = torch.full((4096,), float(self.rank + 1), device=self.device)
+            c10d.all_reduce(t, group=sub)
+            self.assertEqual(t, torch.full_like(t, float(sum(m + 1 for m in members))))
+            c10d.destroy_process_group(sub)
 
     @parametrize("dtype", FLOAT_DTYPES)
     def test_allreduce_avg(self, dtype):
@@ -684,6 +749,18 @@ class ProcessGroupTcclCorrectnessTest(TcclTestBase):
             )
             off += r + 1
 
+    def test_alltoall_one_rank_sends_nothing(self):
+        # Rank 0's input is empty (MoE routing can leave a rank with no tokens).
+        if _ring_topology():
+            self.skipTest("uneven alltoall is mesh-only")
+        ws, r, h = self.world_size, self.rank, 4
+        k = [0] + [1] * (ws - 1)
+        inp = torch.full((ws * k[r], h), float(r), device=self.device)
+        out = torch.empty((sum(k), h), device=self.device)
+        c10d.all_to_all_single(out, inp, k, [k[r]] * ws)
+        expected = torch.cat([torch.full((k[p], h), float(p)) for p in range(ws)])
+        self.assertEqual(out, expected.to(self.device))
+
     @parametrize("algo", ["ring", "mesh"])
     def test_alltoall_large_multichunk(self, algo):
         # Equal split, 1 MB fp32 per segment (> the 512 KB chunk) -> chunk loop.
@@ -945,6 +1022,14 @@ class ProcessGroupTcclContractTest(TcclTestBase):
 
     hw_classification = HardwareClassification.MPS
 
+    def test_alltoall_negative_split_rejects(self):
+        ws = self.world_size
+        splits = [-1] + [1] * (ws - 1)
+        inp = torch.ones(ws, device=self.device)
+        out = torch.empty(ws, device=self.device)
+        with self.assertRaisesRegex(c10d.DistBackendError, "must not be negative"):
+            c10d.all_to_all_single(out, inp, splits, splits)
+
     def test_avg_integer_rejects(self):
         # AVG is float-only (matches NCCL); integer AVG must raise.
         t = self._full(torch.int32)
@@ -1065,6 +1150,52 @@ class ProcessGroupTcclContractTest(TcclTestBase):
                 )
             else:
                 c10d.scatter(out, scatter_list=None, src=0)
+
+
+class ProcessGroupTcclErrorTest(TcclTestBase):
+    """A failed collective leaves its work requests on the queue pairs, so the
+    group must refuse further work instead of running it on stale state. Its own
+    class: it leaves the process group broken."""
+
+    hw_classification = HardwareClassification.MPS
+    timeout = timedelta(seconds=10)
+
+    def test_failed_collective_refuses_new_work(self):
+        if self.rank != 0:
+            self.skipTest("only rank 0 runs the collective its peers never join")
+        # Fail fast, so rank 0 reaches the teardown barrier well within its
+        # peers' timeout.
+        pg = c10d.distributed_c10d._get_default_group()
+        pg._get_backend(self.device)._set_default_timeout(timedelta(seconds=3))
+        t = torch.ones(1024, device=self.device)
+        with self.assertRaises(c10d.DistBackendError):
+            c10d.all_reduce(t)
+        start = time.monotonic()
+        with self.assertRaisesRegex(c10d.DistBackendError, "refuses new work"):
+            c10d.all_reduce(t)
+        self.assertLess(time.monotonic() - start, 2.0)
+
+
+class ProcessGroupTcclReinitTest(TcclTestBase):
+    """Destroy the group and create it again on the same store."""
+
+    hw_classification = HardwareClassification.MPS
+    timeout = timedelta(seconds=30)
+
+    def test_reinit_on_same_store(self):
+        c10d.destroy_process_group()
+        c10d.init_process_group(
+            backend="tccl",
+            store=self.store,
+            rank=self.rank,
+            world_size=self.world_size,
+            device_id=self.device,
+            timeout=self.timeout,
+        )
+        t = self._full(torch.float32)
+        c10d.all_reduce(t)
+        ws = self.world_size
+        self._assert(t, ws * (ws + 1) // 2, torch.float32)
 
 
 instantiate_parametrized_tests(ProcessGroupTcclCorrectnessTest)

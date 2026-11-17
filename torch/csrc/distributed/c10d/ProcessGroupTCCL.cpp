@@ -6,9 +6,11 @@
 
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <c10/util/Exception.h>
+#include <c10/util/Logging.h>
 #include <c10/util/thread_name.h>
 
 #include <ATen/Context.h>
+#include <ATen/Parallel.h>
 #include <ATen/core/jit_type.h>
 #include <ATen/detail/MPSHooksInterface.h>
 #include <ATen/mps/MPSAllocatorInterface.h>
@@ -38,6 +40,12 @@ namespace {
 // pointer, NOT data_ptr() - on MPS data_ptr() folds storage_offset into
 // MTLBuffer arithmetic, unmappable for offset views (e.g. _allgather_base).
 at::Tensor mpsSharedCpuView(const at::Tensor& mpsTensor) {
+  // A zero-byte MPS tensor has no buffer at all; there is nothing to view.
+  if (mpsTensor.numel() == 0) {
+    return at::empty(
+        mpsTensor.sizes(),
+        at::TensorOptions().dtype(mpsTensor.dtype()).device(at::kCPU));
+  }
   auto* allocator = at::mps::getIMPSAllocator();
   const void* storage_ptr = mpsTensor.storage().data_ptr().get();
   // Pair is {cpu_ptr, retain_count}; only the pointer is used here.
@@ -85,6 +93,27 @@ void mpsEventWait(uint32_t eid) {
   auto& hooks = at::detail::getMPSHooks();
   hooks.synchronizeEvent(eid);
   hooks.releaseEvent(eid);
+}
+
+std::string errorText(const std::exception_ptr& ep) {
+  try {
+    std::rethrow_exception(ep);
+  } catch (const c10::Error& e) {
+    return e.what_without_backtrace();
+  } catch (const std::exception& e) {
+    return e.what();
+  } catch (...) {
+    return "unknown error";
+  }
+}
+
+std::exception_ptr distBackendError(const std::string& msg) {
+  try {
+    TORCH_CHECK_WITH(DistBackendError, false, msg);
+  } catch (...) {
+    return std::current_exception();
+  }
+  return nullptr;
 }
 
 constexpr const char* kNotImplementedHint =
@@ -404,6 +433,23 @@ ProcessGroupTCCL::TCCLWork::TCCLWork(
       c10::ListType::create(c10::TensorType::get()));
 }
 
+// The Future's callbacks run where it completes. Completing it on the single
+// worker would let a callback that issues and waits on another collective (the
+// stock PowerSGD hook does) block the very thread that has to run it, so only
+// the Work is finished here, in order, and the Future on another thread.
+void ProcessGroupTCCL::TCCLWork::finishWork(std::exception_ptr exception) {
+  finish(exception);
+  at::launch([future = future_,
+              outputs = outputs_,
+              exception = std::move(exception)]() {
+    if (exception) {
+      future->setError(exception);
+    } else {
+      future->markCompleted(c10::IValue(outputs));
+    }
+  });
+}
+
 // ProcessGroupTCCL
 
 ProcessGroupTCCL::ProcessGroupTCCL(
@@ -452,8 +498,12 @@ ProcessGroupTCCL::ProcessGroupTCCL(
       "); use mesh for <=2 ranks.");
 
   // 1. Resolve the per-peer RDMA device list.
-  const std::vector<std::string> peerDevices =
-      resolveTcclPeerDevices(rank, size, options_->device_name, ringTopology);
+  const std::vector<std::string> peerDevices = resolveTcclPeerDevices(
+      rank,
+      size,
+      options_->device_name,
+      ringTopology,
+      options_->global_ranks_in_group);
 
   // 2. num_wires sanity
   const int num_wires = options_->num_wires;
@@ -493,6 +543,7 @@ ProcessGroupTCCL::ProcessGroupTCCL(
   //    use for destination exchange are prefixed with this number.
   const int64_t initSeq = tcclInitSequence(*store_, rank, options_->timeout);
   const std::string keyPrefix = "tccl_dest_s" + std::to_string(initSeq) + "_";
+  keyPrefix_ = "tccl_s" + std::to_string(initSeq) + "_";
 
   // 5. Construct one TCCLConnection per (peer, wire). Each constructor opens
   // its
@@ -598,10 +649,25 @@ ProcessGroupTCCL::ProcessGroupTCCL(
 }
 
 ProcessGroupTCCL::~ProcessGroupTCCL() {
-  stop_.store(true);
+  {
+    // Under the lock, or the worker can test the predicate, miss this notify
+    // and sleep forever, hanging the join.
+    std::lock_guard<std::mutex> lock(workMutex_);
+    stop_.store(true);
+  }
   workCV_.notify_all();
   if (workerThread_.joinable()) {
     workerThread_.join();
+  }
+  // Fail the Work of what never ran, so nobody waits on it forever. Nothing may
+  // escape a destructor.
+  try {
+    for (auto& task : workQueue_) {
+      task(/*run=*/false);
+    }
+  } catch (...) {
+    LOG(ERROR) << "TCCL: failing the queued work at destruction: "
+               << errorText(std::current_exception());
   }
 }
 
@@ -620,7 +686,7 @@ void ProcessGroupTCCL::runLoop() {
     lock.unlock();
     // Run without holding the queue mutex so the main thread can keep
     // enqueuing follow-on work for the next collective.
-    task();
+    task(/*run=*/true);
     lock.lock();
   }
 }
@@ -631,27 +697,52 @@ void ProcessGroupTCCL::runLoop() {
 // (non-blocking commitAndContinue keeps the serial queue free so autograd / DDP
 // overlap the RDMA transfer), enqueue a lambda that waits the event and runs
 // `fn` on the worker, return a TCCLWork the caller blocks on via wait().
-c10::intrusive_ptr<Work> ProcessGroupTCCL::enqueueCollective(
-    OpType opType,
-    std::vector<at::Tensor> outputs,
-    std::function<void()> fn) {
+c10::intrusive_ptr<ProcessGroupTCCL::TCCLWork> ProcessGroupTCCL::
+    enqueueCollective(
+        OpType opType,
+        std::vector<at::Tensor> outputs,
+        std::function<void()> fn,
+        bool dataPath) {
+  const auto refused = [this]() {
+    return "TCCL: an earlier collective on this process group failed (" +
+        brokenReason_ +
+        "); its work requests may still be posted on the queue pairs, so the "
+        "group refuses new work. Destroy it and create a new one.";
+  };
+  TORCH_CHECK_WITH(DistBackendError, !dataPath || !broken_.load(), refused());
   const uint32_t mpsEventId = mpsEventRecord();
   const uint64_t mySeq = ++seq_;
   auto work = c10::make_intrusive<TCCLWork>(opType, mySeq, std::move(outputs));
   {
     std::lock_guard<std::mutex> lock(workMutex_);
-    workQueue_.emplace_back([mpsEventId, fn = std::move(fn), work]() mutable {
-      std::exception_ptr ep;
-      try {
-        // Block only this worker until the GPU flushes writes to the inputs
-        mpsEventWait(mpsEventId);
-        fn();
-      } catch (...) {
-        ep = std::current_exception();
-      }
-      // Store any exception and wake threads blocked on Work::wait().
-      work->finishWork(ep);
-    });
+    workQueue_.emplace_back(
+        [this, mpsEventId, fn = std::move(fn), work, dataPath, refused](
+            bool run) mutable {
+          std::exception_ptr ep;
+          if (!run) {
+            at::detail::getMPSHooks().releaseEvent(mpsEventId);
+            ep = distBackendError(
+                "TCCL: the process group was destroyed before this work ran.");
+          } else if (dataPath && broken_.load()) {
+            at::detail::getMPSHooks().releaseEvent(mpsEventId);
+            ep = distBackendError(refused());
+          } else {
+            try {
+              // Block only this worker until the GPU flushes writes to the
+              // inputs
+              mpsEventWait(mpsEventId);
+              fn();
+            } catch (...) {
+              ep = std::current_exception();
+              if (dataPath && !broken_.load()) {
+                brokenReason_ = errorText(ep);
+                broken_.store(true);
+              }
+            }
+          }
+          // Store any exception and wake threads blocked on Work::wait().
+          work->finishWork(ep);
+        });
   }
   workCV_.notify_one();
   return work;
@@ -1493,6 +1584,10 @@ c10::intrusive_ptr<Work> ProcessGroupTCCL::alltoall_base(
         "TCCL alltoall_base: split-size vectors must have world_size entries.");
     std::size_t so = 0, ro = 0;
     for (int p = 0; p < ws; ++p) {
+      TORCH_CHECK_WITH(
+          DistBackendError,
+          inputSplitSizes[p] >= 0 && outputSplitSizes[p] >= 0,
+          "TCCL alltoall_base: split sizes must not be negative.");
       sOff[p] = so;
       sBytes[p] = static_cast<std::size_t>(inputSplitSizes[p]) * inRow;
       so += sBytes[p];
@@ -1506,6 +1601,14 @@ c10::intrusive_ptr<Work> ProcessGroupTCCL::alltoall_base(
             ro == static_cast<std::size_t>(outputBuffer.nbytes()),
         "TCCL alltoall_base: split sizes do not sum to the buffer sizes.");
   }
+  TORCH_CHECK_WITH(
+      DistBackendError,
+      sBytes[rank_] == rBytes[rank_],
+      "TCCL alltoall_base: this rank's own input and output splits differ (",
+      sBytes[rank_],
+      " vs ",
+      rBytes[rank_],
+      " bytes); the slab a rank sends itself must fit the slot it receives.");
 
   // Ring requires equal (uniform) segments + ws > 2; tcclUseRing only returns
   // true under TCCL_FORCE_ALGO=ring or ring topology. Everything else (the
@@ -1589,6 +1692,11 @@ c10::intrusive_ptr<Work> ProcessGroupTCCL::send(
       ".");
   // Byte movement - any dtype. tag is accepted but not hardware-matched (UC has
   // no tag matching); ordering is the per-peer FIFO of matched send/recv pairs.
+  if (coalescing_) {
+    auto work = c10::make_intrusive<TCCLWork>(OpType::SEND, ++seq_);
+    coalescedOps_.push_back({/*isSend=*/true, dstRank, tensor, work});
+    return work;
+  }
   return enqueueCollective(
       OpType::SEND,
       std::vector<at::Tensor>{},
@@ -1637,6 +1745,12 @@ c10::intrusive_ptr<Work> ProcessGroupTCCL::recv(
       " is not a neighbor of rank ",
       rank_,
       ".");
+  if (coalescing_) {
+    auto work = c10::make_intrusive<TCCLWork>(
+        OpType::RECV, ++seq_, std::vector<at::Tensor>{tensor});
+    coalescedOps_.push_back({/*isSend=*/false, srcRank, tensor, work});
+    return work;
+  }
   return enqueueCollective(
       OpType::RECV,
       std::vector<at::Tensor>{tensor},
@@ -1656,15 +1770,94 @@ c10::intrusive_ptr<Work> ProcessGroupTCCL::barrier(
   // No data path - Store::barrier is the optimized server-side primitive.
   // Fresh sequence number per call so rapid-fire barriers don't collide.
   const uint64_t mySeq = ++barrierSeq_;
-  const std::string key = "tccl_barrier_" + std::to_string(mySeq);
+  const std::string key = keyPrefix_ + "barrier_" + std::to_string(mySeq);
+  // Queued behind this rank's earlier work, so it returns only once that work
+  // is done, as with Gloo.
+  return enqueueCollective(
+      OpType::BARRIER,
+      std::vector<at::Tensor>{},
+      // The worker catches what a task throws and reports it through its Work.
+      // NOLINTNEXTLINE(bugprone-exception-escape)
+      [this, key]() mutable {
+        tcclRtsBarrier(*store_, size_, key, options_->timeout);
+      },
+      /*dataPath=*/false);
+}
 
-  // Run the barrier synchronously on the calling thread, then return a
-  // pre-completed Work.
-  tcclRtsBarrier(*store_, size_, key, options_->timeout);
+// batch_isend_irecv
 
-  auto work = c10::make_intrusive<TCCLWork>(OpType::BARRIER, mySeq);
-  work->finishWork();
-  return work;
+void ProcessGroupTCCL::startCoalescing() {
+  TORCH_CHECK_WITH(
+      DistBackendError,
+      !coalescing_,
+      "TCCL: startCoalescing called while a batch is already open.");
+  coalescing_ = true;
+}
+
+c10::intrusive_ptr<Work> ProcessGroupTCCL::endCoalescing() {
+  TORCH_CHECK_WITH(
+      DistBackendError,
+      coalescing_,
+      "TCCL: endCoalescing called without startCoalescing.");
+  coalescing_ = false;
+  std::vector<P2POp> ops = std::move(coalescedOps_);
+  coalescedOps_.clear();
+  // Even an empty batch goes through the worker, so its Work completes only
+  // after everything queued before it, which the coalescing manager relies on.
+  c10::intrusive_ptr<TCCLWork> batch;
+  try {
+    batch = enqueueCollective(
+        OpType::COALESCED, std::vector<at::Tensor>{}, [this, ops]() mutable {
+          std::exception_ptr ep;
+          try {
+            // The i-th send to a peer pairs with that peer's i-th recv from
+            // this rank, so round i runs every peer's i-th op in each
+            // direction.
+            std::vector<std::vector<const P2POp*>> sends(size_), recvs(size_);
+            std::size_t rounds = 0;
+            for (const auto& op : ops) {
+              auto& q = op.isSend ? sends[op.peer] : recvs[op.peer];
+              q.push_back(&op);
+              rounds = std::max(rounds, q.size());
+            }
+            std::vector<at::Tensor> views;
+            for (std::size_t r = 0; r < rounds; ++r) {
+              std::vector<const char*> sendPtr(size_, nullptr);
+              std::vector<char*> recvPtr(size_, nullptr);
+              std::vector<std::size_t> sendBytes(size_, 0), recvBytes(size_, 0);
+              for (int p = 0; p < size_; ++p) {
+                if (r < sends[p].size()) {
+                  views.push_back(mpsSharedCpuView(sends[p][r]->tensor));
+                  sendPtr[p] =
+                      static_cast<const char*>(views.back().data_ptr());
+                  sendBytes[p] = views.back().nbytes();
+                }
+                if (r < recvs[p].size()) {
+                  views.push_back(mpsSharedCpuView(recvs[p][r]->tensor));
+                  recvPtr[p] = static_cast<char*>(views.back().data_ptr());
+                  recvBytes[p] = views.back().nbytes();
+                }
+              }
+              engine_->exchange(
+                  sendPtr, sendBytes, recvPtr, recvBytes, "TCCL p2p batch");
+            }
+          } catch (...) {
+            ep = std::current_exception();
+          }
+          for (auto& op : ops) {
+            op.work->finishWork(ep);
+          }
+          if (ep) {
+            std::rethrow_exception(ep);
+          }
+        });
+  } catch (...) {
+    for (auto& op : ops) {
+      op.work->finishWork(std::current_exception());
+    }
+    throw;
+  }
+  return batch;
 }
 
 } // namespace c10d
