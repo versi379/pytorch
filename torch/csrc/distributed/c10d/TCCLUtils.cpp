@@ -195,8 +195,9 @@ std::string resolveTcclDeviceName(const std::string& explicit_name) {
   TORCH_CHECK_WITH(
       DistBackendError,
       !devices.empty(),
-      "TCCL: no RDMA devices visible. Check that macOS is >= 26.2, RDMA "
-      "is enabled, and Thunderbolt is unbridged (`sudo tbtrdmactl unbridge`). Run "
+      "TCCL: no RDMA devices visible. Check that macOS is >= 26.2, that "
+      "`rdma_ctl status` reports RDMA enabled, and that the Thunderbolt "
+      "interfaces are not members of a bridge (`ifconfig bridge0`). Run "
       "torch.distributed.list_tccl_devices() for a standalone diagnostic.");
   TORCH_CHECK_WITH(
       DistBackendError,
@@ -342,7 +343,8 @@ TCCLConnection::TCCLConnection(const std::string& device_name)
       "TCCL: failed to open RDMA device '",
       device_name,
       "'. Available devices: see torch.distributed.list_tccl_devices(). ",
-      "If empty, Thunderbolt may be bridged - run `sudo tbtrdmactl unbridge`.");
+      "If empty, the Thunderbolt interfaces may be members of a bridge "
+      "(`ifconfig bridge0`).");
 
   // PD/CQ/QP allocation: any failure here means we partially constructed -
   // call destroy() to free what we did get before rethrowing.

@@ -4501,8 +4501,8 @@ required.)");
   // Diagnostic: enumerate RDMA devices visible to librdma on this host.
   // Loads librdma.dylib via dlopen on first call (singleton). Returns an
   // empty list when the library loads but no devices are present (most
-  // likely Thunderbolt is bridged — user should run `sudo tbtrdmactl
-  // unbridge`). Throws RuntimeError when librdma itself can't be loaded.
+  // likely the Thunderbolt interfaces are members of a bridge). Throws
+  // RuntimeError when librdma itself can't be loaded.
   module.def(
       "_tccl_list_devices",
       &::c10d::listRdmaDevices,
@@ -4510,10 +4510,10 @@ required.)");
       R"(Enumerate RDMA devices visible to TCCL on this host.
 
 Returns a list of device names (e.g. ``["rdma_en2"]``). Returns an empty
-list if Thunderbolt RDMA is enabled but no devices appear — most likely
-the Thunderbolt fabric is bridged and needs ``sudo tbtrdmactl unbridge``.
-Raises RuntimeError if ``librdma.dylib`` cannot be loaded (e.g. macOS
-< 26.2 or RDMA not enabled via ``bputil``).)");
+list if Thunderbolt RDMA is enabled but no devices appear, most likely
+because the Thunderbolt interfaces are members of a bridge (``ifconfig
+bridge0``). Raises RuntimeError if ``librdma.dylib`` cannot be loaded (e.g.
+macOS < 26.2 or RDMA not enabled, see ``rdma_ctl status``).)");
 #endif
 
 #ifdef USE_C10D_NCCL

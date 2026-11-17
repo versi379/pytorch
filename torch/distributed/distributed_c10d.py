@@ -2188,13 +2188,12 @@ def list_tccl_devices() -> list[str]:
 
     Returns:
         list[str]: Device names (e.g. ``["rdma_en2"]``). Empty if the library
-        loads but no devices appear -- most likely the Thunderbolt fabric is
-        bridged. Run ``sudo tbtrdmactl unbridge`` and try again.
+        loads but no devices appear, most likely because the Thunderbolt
+        interfaces are members of a bridge (``ifconfig bridge0``).
 
     Raises:
         RuntimeError: if ``librdma.dylib`` cannot be loaded (e.g. macOS
-            < 26.2 or RDMA not enabled via ``bputil -enable rdma`` in
-            Recovery Mode).
+            < 26.2 or RDMA not enabled, see ``rdma_ctl status``).
     """
     if not is_tccl_available():
         raise RuntimeError(

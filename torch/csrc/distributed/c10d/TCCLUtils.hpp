@@ -259,7 +259,7 @@ class TORCH_API TCCLSharedBuffer {
 // Lists the names of RDMA devices visible to librdma on this host.
 // Loads the singleton TCCLIBVWrapper if not already loaded. Returns an empty
 // vector if the library loads but the device list is empty (e.g.
-// Thunderbolt is bridged - user must run `sudo tbtrdmactl unbridge`).
+// the Thunderbolt interfaces are members of a bridge).
 // Throws DistBackendError if librdma cannot be loaded.
 TORCH_API std::vector<std::string> listRdmaDevices();
 
