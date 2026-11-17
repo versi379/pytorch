@@ -259,6 +259,21 @@ class ProcessGroupTcclCorrectnessTest(TcclTestBase):
             self._assert(t, 1 if op == "MIN" else self.world_size, dtype)
 
     @parametrize("dtype", FLOAT_DTYPES)
+    @parametrize("op", ["MIN", "MAX"])
+    @parametrize("algo", ["ring", "mesh"])
+    def test_allreduce_minmax_nan(self, dtype, op, algo):
+        # Each rank puts a NaN at its own index; every rank must get all of them,
+        # whichever peer they arrived from.
+        t = self._full(dtype)
+        t[self.rank] = float("nan")
+        with _force_algo(algo):
+            c10d.all_reduce(t, op=getattr(c10d.ReduceOp, op))
+        ws = self.world_size
+        expected = torch.full_like(t, ws if op == "MAX" else 1)
+        expected[:ws] = float("nan")
+        self.assertEqual(t, expected, equal_nan=True)
+
+    @parametrize("dtype", FLOAT_DTYPES)
     def test_allreduce_avg(self, dtype):
         t = self._full(dtype)
         c10d.all_reduce(t, op=c10d.ReduceOp.AVG)
@@ -366,6 +381,15 @@ class ProcessGroupTcclCorrectnessTest(TcclTestBase):
             else:
                 ws = self.world_size
                 self._assert(t, ws * (ws + 1) // 2 if op == "SUM" else ws, dtype)
+
+    @parametrize("dtype", REDUCE_DTYPES)
+    def test_reduce_nonroot_input_unchanged(self, dtype):
+        root = self.world_size - 1
+        t = self._full(dtype)
+        before = t.clone()
+        c10d.reduce(t, dst=root, op=c10d.ReduceOp.SUM)
+        if self.rank != root:
+            self.assertEqual(t, before)
 
     @parametrize("dtype", FLOAT_DTYPES)
     def test_reduce_avg(self, dtype):
