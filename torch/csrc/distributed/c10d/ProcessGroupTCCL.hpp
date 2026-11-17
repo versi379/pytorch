@@ -2,6 +2,7 @@
 
 #ifdef USE_C10D_TCCL
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -104,6 +105,7 @@ class TORCH_API ProcessGroupTCCL : public Backend {
 
   void setTimeout(std::chrono::milliseconds timeout) override {
     options_->timeout = timeout;
+    engineTimeout_.store(timeout);
   }
 
   // Collective overrides
@@ -194,8 +196,8 @@ class TORCH_API ProcessGroupTCCL : public Backend {
   c10::intrusive_ptr<Options> options_;
   // Resolved in ctor from options_ + TCCL_TOPOLOGY
   Topology topology_{Topology::Mesh};
-  uint64_t seq_{0};
-  uint64_t barrierSeq_{0};
+  std::atomic<uint64_t> seq_{0};
+  std::atomic<uint64_t> barrierSeq_{0};
 
   // One TCCLConnection per (peer_rank, wire) - one UC queue pair each. Index
   // = peer_rank * num_wires + wire. Slots at peer_rank == rank_ stay null.
@@ -215,6 +217,8 @@ class TORCH_API ProcessGroupTCCL : public Backend {
 
   // RDMA collective engine. Constructed after buffers are. Holds references
   // into connections_/sendBuffers_/recvBuffers_;
+  // The engine reads this from the worker; setTimeout writes it from Python.
+  std::atomic<std::chrono::milliseconds> engineTimeout_{kBackendDefaultTimeout};
   std::unique_ptr<TCCLEngine> engine_;
 
   // Worker thread model. Spawned at the end of the constructor

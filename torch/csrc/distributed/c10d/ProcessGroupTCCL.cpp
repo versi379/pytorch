@@ -110,7 +110,7 @@ inline bool isFloatReduceDtype(at::ScalarType st) {
 }
 
 // Ring-vs-mesh selection for all_reduce (N>2): bf16 -> ring at any size,
-// fp32/fp16 -> ring only >=8MB. TCCL_FORCE_ALGO=ring|mesh overrides per-call.
+// fp32/fp16 -> ring from 1 MB. TCCL_FORCE_ALGO=ring|mesh overrides per-call.
 inline bool tcclUseRing(
     int worldSize,
     bool autoEnable,
@@ -581,6 +581,7 @@ ProcessGroupTCCL::ProcessGroupTCCL(
 
   // 10. Construct the collective engine (holds refs into our connection +
   // buffer vectors).
+  engineTimeout_.store(options_->timeout);
   engine_ = std::make_unique<TCCLEngine>(
       rank,
       size,
@@ -589,7 +590,7 @@ ProcessGroupTCCL::ProcessGroupTCCL(
       recvBuffers_,
       pipeSendBuffers_,
       pipeRecvBuffers_,
-      options_->timeout,
+      engineTimeout_,
       /*ring_topology=*/ringTopology);
 
   // 11. Spawn the worker thread.
@@ -859,16 +860,18 @@ c10::intrusive_ptr<Work> ProcessGroupTCCL::reduce(
       DistBackendError,
       tensor.is_contiguous(),
       "TCCL reduce: non-contiguous tensors are not supported. Call .contiguous().");
-  // Runs as all-reduce - reduced value on every rank (reduce guarantees only
-  // the root). rootRank is validated, not used in the reduction.
+  // Runs as an all-reduce. Non-root ranks reduce into a copy so their input
+  // is left untouched, as with NCCL and Gloo.
   const ReduceOp::RedOpType op = opts.reduceOp;
   const int worldSize = size_;
   const at::ScalarType st = tensor.scalar_type();
+  const bool isRoot = (rank_ == opts.rootRank);
   return enqueueCollective(
       OpType::REDUCE,
       std::vector<at::Tensor>{tensor},
-      [this, tensor, op, worldSize, st]() mutable {
-        at::Tensor cpuView = mpsSharedCpuView(tensor);
+      [this, tensor, op, worldSize, st, isRoot]() mutable {
+        at::Tensor cpuView = isRoot ? mpsSharedCpuView(tensor)
+                                    : mpsSharedCpuView(tensor).clone();
         switch (st) {
           case at::kFloat:
             runMeshAllreduce<float>(*engine_, cpuView, op, worldSize);

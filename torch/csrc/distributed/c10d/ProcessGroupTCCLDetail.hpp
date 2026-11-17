@@ -5,7 +5,9 @@
 // TCCL collective-algorithm engine and reduction-op templates
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <memory>
@@ -226,7 +228,6 @@ inline void TCCLProdOp<bool>::operator()(
     for (std::size_t i = 0; i < n; ++i)                       \
       output[i] = std::min(output[i], input[i]);              \
   }
-TCCL_DEFINE_MINMAX(float)
 TCCL_DEFINE_MINMAX(int8_t)
 TCCL_DEFINE_MINMAX(int16_t)
 TCCL_DEFINE_MINMAX(int32_t)
@@ -235,24 +236,34 @@ TCCL_DEFINE_MINMAX(uint8_t)
 TCCL_DEFINE_MINMAX(bool)
 #undef TCCL_DEFINE_MINMAX
 
-#define TCCL_DEFINE_MINMAX_VIA_FLOAT(TYPE)                               \
+// Floating MIN/MAX propagate NaN like torch.max/torch.min; std::max/std::min
+// would keep or drop a NaN depending on argument order, so ranks could differ.
+inline float tcclMaxNan(float a, float b) {
+  return (std::isnan(a) || a > b) ? a : b;
+}
+inline float tcclMinNan(float a, float b) {
+  return (std::isnan(a) || a < b) ? a : b;
+}
+
+#define TCCL_DEFINE_MINMAX_FLOAT(TYPE)                                   \
   template <>                                                            \
   inline void TCCLMaxOp<TYPE>::operator()(                               \
       const TYPE* input, TYPE* output, std::size_t n) const {            \
     for (std::size_t i = 0; i < n; ++i)                                  \
-      output[i] = static_cast<TYPE>(std::max(                            \
+      output[i] = static_cast<TYPE>(tcclMaxNan(                          \
           static_cast<float>(output[i]), static_cast<float>(input[i]))); \
   }                                                                      \
   template <>                                                            \
   inline void TCCLMinOp<TYPE>::operator()(                               \
       const TYPE* input, TYPE* output, std::size_t n) const {            \
     for (std::size_t i = 0; i < n; ++i)                                  \
-      output[i] = static_cast<TYPE>(std::min(                            \
+      output[i] = static_cast<TYPE>(tcclMinNan(                          \
           static_cast<float>(output[i]), static_cast<float>(input[i]))); \
   }
-TCCL_DEFINE_MINMAX_VIA_FLOAT(c10::Half)
-TCCL_DEFINE_MINMAX_VIA_FLOAT(c10::BFloat16)
-#undef TCCL_DEFINE_MINMAX_VIA_FLOAT
+TCCL_DEFINE_MINMAX_FLOAT(float)
+TCCL_DEFINE_MINMAX_FLOAT(c10::Half)
+TCCL_DEFINE_MINMAX_FLOAT(c10::BFloat16)
+#undef TCCL_DEFINE_MINMAX_FLOAT
 
 // TCCLEngine
 
@@ -276,7 +287,7 @@ class TCCLEngine {
       std::vector<TCCLSharedBuffer>& recv_buffers,
       std::vector<TCCLSharedBuffer>& pipe_send_buffers,
       std::vector<TCCLSharedBuffer>& pipe_recv_buffers,
-      const std::chrono::milliseconds& timeout,
+      const std::atomic<std::chrono::milliseconds>& timeout,
       bool ring_topology = false)
       : rank_(rank),
         size_(size),
@@ -478,7 +489,10 @@ class TCCLEngine {
   // (which stay one-per-peer for the PIPELINE=1 mesh/p2p/broadcast paths).
   std::vector<TCCLSharedBuffer>& pipe_send_buffers_;
   std::vector<TCCLSharedBuffer>& pipe_recv_buffers_;
-  const std::chrono::milliseconds& timeout_;
+  std::chrono::milliseconds timeout() const {
+    return timeout_.load(std::memory_order_relaxed);
+  }
+  const std::atomic<std::chrono::milliseconds>& timeout_;
   // True => mesh_exchange must never be reached
   const bool ring_topology_{false};
 };

@@ -135,7 +135,7 @@ void TCCLEngine::mesh_exchange(
     };
     fill_send();
     fill_recv();
-    auto deadline = std::chrono::steady_clock::now() + timeout_;
+    auto deadline = std::chrono::steady_clock::now() + timeout();
     while ((do_send && send_done < total_bytes) ||
            (do_recv && recv_done < total_bytes)) {
       int n = connections_[peer]->pollCq(
@@ -144,7 +144,7 @@ void TCCLEngine::mesh_exchange(
         TORCH_CHECK_WITH(
             DistBackendError,
             std::chrono::steady_clock::now() <= deadline,
-            "TCCL mesh(2-node): timed out after ", timeout_.count(),
+            "TCCL mesh(2-node): timed out after ", timeout().count(),
             " ms (send ", send_done, "/", do_send ? total_bytes : 0,
             ", recv ", recv_done, "/", do_recv ? total_bytes : 0, " peer ", peer,
             "). The poll bound is the process-group timeout; a persistent stall "
@@ -174,7 +174,7 @@ void TCCLEngine::mesh_exchange(
           fill_recv();
         }
       }
-      deadline = std::chrono::steady_clock::now() + timeout_;
+      deadline = std::chrono::steady_clock::now() + timeout();
     }
     return;
   }
@@ -242,7 +242,7 @@ void TCCLEngine::mesh_exchange(
       }
       return true;
     };
-    auto deadline = std::chrono::steady_clock::now() + timeout_;
+    auto deadline = std::chrono::steady_clock::now() + timeout();
     while (!all_done()) {
       bool made_progress = false;
       for (int p = 0; p < size_; ++p) {
@@ -274,7 +274,7 @@ void TCCLEngine::mesh_exchange(
         }
       }
       if (made_progress) {
-        deadline = std::chrono::steady_clock::now() + timeout_;
+        deadline = std::chrono::steady_clock::now() + timeout();
       } else if (std::chrono::steady_clock::now() > deadline) {
         std::string outstanding;
         for (int p = 0; p < size_; ++p) {
@@ -286,7 +286,7 @@ void TCCLEngine::mesh_exchange(
         }
         TORCH_CHECK_WITH(
             DistBackendError, false,
-            "TCCL mesh(pipe): timed out after ", timeout_.count(),
+            "TCCL mesh(pipe): timed out after ", timeout().count(),
             " ms (total_bytes=", total_bytes, "). outstanding:", outstanding,
             ". A persistent stall here indicates a dropped UC packet.");
       }
@@ -343,7 +343,7 @@ void TCCLEngine::mesh_exchange(
     int completions_seen = 0;
 
     auto deadline =
-        std::chrono::steady_clock::now() + timeout_;
+        std::chrono::steady_clock::now() + timeout();
 
     while (completions_seen < expected_completions) {
       bool made_progress = false;
@@ -414,7 +414,7 @@ void TCCLEngine::mesh_exchange(
             DistBackendError,
             false,
             "TCCL mesh: timed out after ",
-            timeout_.count(),
+            timeout().count(),
             " ms waiting for completions at offset ",
             offset,
             " (total_bytes=",
@@ -517,7 +517,7 @@ void TCCLEngine::ring_step(
   post_recv_piece();
   post_send_piece();
 
-  auto deadline = std::chrono::steady_clock::now() + timeout_;
+  auto deadline = std::chrono::steady_clock::now() + timeout();
   while (recv_off < recv_bytes || send_off < send_bytes) {
     bool made_progress = false;
     // For a ring (size_ > 2) recv_peer != send_peer, so each peer's CQ carries
@@ -559,7 +559,7 @@ void TCCLEngine::ring_step(
             DistBackendError,
             false,
             "TCCL ring: timed out after ",
-            timeout_.count(),
+            timeout().count(),
             " ms. send ",
             send_off,
             "/",
@@ -670,7 +670,7 @@ void TCCLEngine::bidir_ring_step(
         bsend_done >= sendB_bytes && brecv_done >= recvB_bytes;
   };
 
-  auto deadline = std::chrono::steady_clock::now() + timeout_;
+  auto deadline = std::chrono::steady_clock::now() + timeout();
   while (!done()) {
     bool made_progress = false;
 
@@ -747,13 +747,13 @@ void TCCLEngine::bidir_ring_step(
     }
 
     if (made_progress) {
-      deadline = std::chrono::steady_clock::now() + timeout_;
+      deadline = std::chrono::steady_clock::now() + timeout();
     } else if (std::chrono::steady_clock::now() > deadline) {
       TORCH_CHECK_WITH(
           DistBackendError,
           false,
           "TCCL bidir-ring: timed out after ",
-          timeout_.count(),
+          timeout().count(),
           " ms. A send ",
           asend_done,
           "/",
@@ -1069,7 +1069,7 @@ inline void TCCLEngine::ring_broadcast(
   std::vector<ibv_wc> wcs(8);
 
   auto poll_one = [&](int peer, bool want_send) {
-    auto deadline = std::chrono::steady_clock::now() + timeout_;
+    auto deadline = std::chrono::steady_clock::now() + timeout();
     while (true) {
       int n = connections_[peer]->pollCq(static_cast<int>(wcs.size()), wcs.data());
       for (int i = 0; i < n; ++i) {
@@ -1086,7 +1086,7 @@ inline void TCCLEngine::ring_broadcast(
       if (n == 0 && std::chrono::steady_clock::now() > deadline) {
         TORCH_CHECK_WITH(
             DistBackendError, false,
-            "TCCL ring_broadcast: timed out after ", timeout_.count(),
+            "TCCL ring_broadcast: timed out after ", timeout().count(),
             " ms (root=", root, ", pos=", pos, "). The poll bound is the process-"
             "group timeout (init_process_group(timeout=) / set_timeout).");
       }
@@ -1357,14 +1357,14 @@ inline void TCCLEngine::p2p_send(
     }
   };
   fill();
-  auto deadline = std::chrono::steady_clock::now() + timeout_;
+  auto deadline = std::chrono::steady_clock::now() + timeout();
   while (done < nbytes) {
     int n = connections_[dst]->pollCq(static_cast<int>(wcs.size()), wcs.data());
     if (n == 0) {
       TORCH_CHECK_WITH(
           DistBackendError,
           std::chrono::steady_clock::now() <= deadline,
-          "TCCL p2p_send: timed out after ", timeout_.count(), " ms sending ",
+          "TCCL p2p_send: timed out after ", timeout().count(), " ms sending ",
           done, "/", nbytes, " bytes to peer ", dst,
           ". The poll bound is the process-group timeout; a persistent stall here "
           "indicates a dropped UC packet (no hardware retransmission).");
@@ -1382,7 +1382,7 @@ inline void TCCLEngine::p2p_send(
       --inflight;
     }
     fill();
-    deadline = std::chrono::steady_clock::now() + timeout_;
+    deadline = std::chrono::steady_clock::now() + timeout();
   }
 }
 
@@ -1414,14 +1414,14 @@ inline void TCCLEngine::p2p_recv(
     }
   };
   fill();
-  auto deadline = std::chrono::steady_clock::now() + timeout_;
+  auto deadline = std::chrono::steady_clock::now() + timeout();
   while (done < nbytes) {
     int n = connections_[src]->pollCq(static_cast<int>(wcs.size()), wcs.data());
     if (n == 0) {
       TORCH_CHECK_WITH(
           DistBackendError,
           std::chrono::steady_clock::now() <= deadline,
-          "TCCL p2p_recv: timed out after ", timeout_.count(), " ms receiving ",
+          "TCCL p2p_recv: timed out after ", timeout().count(), " ms receiving ",
           done, "/", nbytes, " bytes from peer ", src,
           ". The poll bound is the process-group timeout; a persistent stall here "
           "indicates a dropped UC packet (no hardware retransmission).");
@@ -1443,7 +1443,7 @@ inline void TCCLEngine::p2p_recv(
       --inflight;
     }
     fill();
-    deadline = std::chrono::steady_clock::now() + timeout_;
+    deadline = std::chrono::steady_clock::now() + timeout();
   }
 }
 
@@ -1502,7 +1502,7 @@ inline void TCCLEngine::all_to_all(
     return false;
   };
 
-  auto deadline = std::chrono::steady_clock::now() + timeout_;
+  auto deadline = std::chrono::steady_clock::now() + timeout();
   while (remaining()) {
     bool progress = false;
     for (int p = 0; p < size_; ++p) {
@@ -1532,12 +1532,12 @@ inline void TCCLEngine::all_to_all(
       }
     }
     if (progress) {
-      deadline = std::chrono::steady_clock::now() + timeout_;
+      deadline = std::chrono::steady_clock::now() + timeout();
     } else {
       TORCH_CHECK_WITH(
           DistBackendError,
           std::chrono::steady_clock::now() <= deadline,
-          "TCCL alltoall(mesh): timed out after ", timeout_.count(),
+          "TCCL alltoall(mesh): timed out after ", timeout().count(),
           " ms. The poll bound is the process-group timeout; a persistent stall "
           "indicates a dropped UC packet (no hardware retransmission).");
     }
