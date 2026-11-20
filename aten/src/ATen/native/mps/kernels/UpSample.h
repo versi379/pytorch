@@ -11,8 +11,8 @@
 // gather backward) fold the remaining (n, c) planes into per-thread
 // loops; measured knee on M-series GPUs.
 C10_METAL_CONSTEXPR uint32_t PLANE_GRID_TGS_PER_CORE = 16;
-// Target threadgroup size when a channels_last plane grid has fewer planes than
-// a simdgroup and widens along x.
+// Target threadgroup size when a channels_last plane grid has at most a
+// simdgroup of planes and widens along x (or y, with the planes on x).
 C10_METAL_CONSTEXPR uint32_t PLANE_GRID_TARGET_TG_THREADS = 256;
 
 template <unsigned N = 5>

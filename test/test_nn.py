@@ -10687,6 +10687,23 @@ class TestNNDeviceType(NNTestCase):
             )
             self.assertEqual(out_t, expected)
 
+    @parametrize_test("mode", ["nearest", "nearest-exact", "bilinear", "bicubic", "bilinear_aa", "bicubic_aa"])
+    @parametrize_test("n, c", [(1, 32), (2, 16), (1, 33), (1, 64)])
+    def test_upsampling2d_channels_last_planes(self, device, mode, n, c):
+        # On MPS, a channels_last grid with exactly a simdgroup of planes puts the planes on x: N * C == 32 takes
+        # that launch on any GPU, and the 128x128 output also does for 33 and 64 planes on up to 32 GPU cores.
+        kwargs = dict(mode=mode.removesuffix("_aa"), antialias=mode.endswith("_aa"))
+        x = make_tensor((n, c, 64, 64), device=device, dtype=torch.float, low=-1, high=1)
+        x = x.contiguous(memory_format=torch.channels_last).requires_grad_()
+        x_ref = x.detach().cpu().double().requires_grad_()
+        out = F.interpolate(x, size=(128, 128), **kwargs)
+        expected = F.interpolate(x_ref, size=(128, 128), **kwargs)
+        self.assertEqual(out.cpu(), expected.float(), atol=1e-4, rtol=1e-4)
+        grad = make_tensor(out.shape, device=device, dtype=torch.float).contiguous(memory_format=torch.channels_last)
+        out.backward(grad)
+        expected.backward(grad.cpu().double())
+        self.assertEqual(x.grad.cpu(), x_ref.grad.float(), atol=1e-4, rtol=1e-4)
+
     @expectedFailureMPS  # NotImplementedError: aten::upsample_trilinear3d.out https://github.com/pytorch/pytorch/issues/77764
     @parametrize_test("align_corners", [True, False])
     @parametrize_test("memory_format", [torch.contiguous_format, torch.channels_last_3d])

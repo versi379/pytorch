@@ -139,8 +139,9 @@ static void upsample_kernel_backward_out_template(const Tensor& grad_input,
       njobs);
 }
 
-// Launch a (w, h, planes) grid over the tensor each thread writes one (y, x) of: `b` for the forward, `a` (grad_input)
-// for the backward. The (n, c) planes that don't fit in the grid fold into per-thread loops.
+// Launch a (w, h, planes) grid, or (planes, w, h) for some channels_last tensors, over the tensor each thread writes
+// one (y, x) of: `b` for the forward, `a` (grad_input) for the backward. The (n, c) planes that don't fit in the grid
+// fold into per-thread loops.
 static void dispatch_plane_grid(const std::string& name,
                                 const Tensor& a,
                                 const Tensor& b,
@@ -181,11 +182,15 @@ static void dispatch_plane_grid(const std::string& name,
       const auto planes =
           std::min(all_planes, at::round_up(at::ceil_div(threads_in_flight, height * width), simd_width));
       // channels_last keeps each simdgroup on adjacent channels (threads are numbered x-first), unless there are
-      // fewer planes than a simdgroup; then widen along x so threadgroups aren't just a handful of threads.
+      // fewer planes than a simdgroup; then widen along x so threadgroups aren't just a handful of threads. With
+      // exactly a simdgroup of planes (large outputs, or N * C == simd_width), put them on x and widen along y
+      // instead, as one simdgroup per threadgroup leaves large outputs bound by the threadgroup count.
+      const bool planes_on_x = channels_last && planes == simd_width;
       const auto tg_planes = std::min(planes, max_threads);
-      const auto cl_width = tg_planes < simd_width ? PLANE_GRID_TARGET_TG_THREADS / tg_planes : 1;
+      const auto cl_width = tg_planes <= simd_width ? PLANE_GRID_TARGET_TG_THREADS / tg_planes : 1;
       const auto tg_width = std::min<NSUInteger>({width, channels_last ? cl_width : max_threads, max_threads});
-      const auto threadgroup = MTLSizeMake(tg_width, 1, std::min(tg_planes, max_threads / tg_width));
+      const auto threadgroup = planes_on_x ? MTLSizeMake(tg_planes, std::min(tg_width, max_threads / tg_planes), 1)
+                                           : MTLSizeMake(tg_width, 1, std::min(tg_planes, max_threads / tg_width));
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       // Metal truncates grid sizes to 32 bits: tile larger H or W and pass each tile's origin.
@@ -193,8 +198,11 @@ static void dispatch_plane_grid(const std::string& name,
       for (NSUInteger y = 0; y < height; y += max_tile) {
         for (NSUInteger x = 0; x < width; x += max_tile) {
           const std::array<int64_t, 2> origin{static_cast<int64_t>(x), static_cast<int64_t>(y)};
-          mtl_setArgs(encoder, a, b, params, channels, origin);
-          [encoder dispatchThreads:MTLSizeMake(std::min(width - x, max_tile), std::min(height - y, max_tile), planes)
+          mtl_setArgs(encoder, a, b, params, channels, origin, planes_on_x);
+          const auto tile_width = std::min(width - x, max_tile);
+          const auto tile_height = std::min(height - y, max_tile);
+          [encoder dispatchThreads:planes_on_x ? MTLSizeMake(planes, tile_width, tile_height)
+                                               : MTLSizeMake(tile_width, tile_height, planes)
               threadsPerThreadgroup:threadgroup];
         }
       }
