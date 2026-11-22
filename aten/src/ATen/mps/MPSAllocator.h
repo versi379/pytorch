@@ -89,6 +89,8 @@ struct BufferBlock {
   MPSEventPtr event;
   // Stream for which this buffer was allocated.
   MPSStream* stream = nullptr;
+  // The graph capture that stream was recording when the buffer was allocated, 0 if none.
+  uint64_t capture_id = 0;
   // Contains streams that have been recorded on this buffer with
   // `recordStream`, along with the most recent event for that stream. All of
   // these events must complete before the buffer can be reused or freed. This
@@ -304,6 +306,9 @@ struct BufferPool {
   // These buffers will be returned to pool once the command buffer's
   // completionHandler callbacks are called.
   std::unordered_set<BufferBlock*> buffers_pending_free;
+  // Buffers a capture allocated, bound and freed while still recording, by capture id. They stay pinned, but later
+  // allocations of the same capture may take them again (see free_buffer).
+  ska::flat_hash_map<uint64_t, std::set<BufferBlock*, BufferComparison>> capture_reusable;
 };
 
 class MPSHeapAllocatorImpl {
@@ -478,6 +483,7 @@ class MPSHeapAllocatorImpl {
   void erase_available_buffer(BufferPool& pool, BufferBlock* buffer_block);
   BufferBlock* get_allocated_buffer_block(const void* ptr);
   BufferBlock* alloc_buffer_block(size_t size, uint32_t usage, bool allow_in_flight_reuse);
+  BufferBlock* reuse_capture_buffer(AllocParams& params, uint64_t capture_id);
   void free_buffer(BufferBlock* buffer_block);
   bool release_cached_buffers();
   // waits for buffers parked in-flight in the pool's pending-free list to finish

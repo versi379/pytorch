@@ -498,6 +498,13 @@ BufferBlock* MPSHeapAllocatorImpl::alloc_buffer_block(size_t size, uint32_t usag
   params.dedicated = params.oversize_threshold_bytes > 0 && alloc_size > kMaxSmallAlloc &&
       alloc_size >= params.oversize_threshold_bytes;
 
+  const uint64_t capture_id = isAnyStreamCapturing() ? getCurrentMPSStream()->activeCaptureId() : 0;
+  if (capture_id != 0 && allow_in_flight_reuse && !(pool.usage & UsageFlags::SCALAR)) {
+    if (BufferBlock* block = reuse_capture_buffer(params, capture_id)) {
+      return block;
+    }
+  }
+
   // first, try to get a block from the existing pool.
   bool block_found = get_free_buffer(params);
   if (!block_found) {
@@ -560,9 +567,33 @@ BufferBlock* MPSHeapAllocatorImpl::alloc_buffer_block(size_t size, uint32_t usag
   }
   buffer_block->in_use = true;
   buffer_block->use_count++;
+  buffer_block->capture_id = capture_id;
   m_current_allocated_memory.increase(buffer_block->size);
   m_active_bytes.increase(buffer_block->size);
   return buffer_block;
+}
+
+BufferBlock* MPSHeapAllocatorImpl::reuse_capture_buffer(AllocParams& params, uint64_t capture_id) {
+  BufferPool& pool = *params.pool;
+  auto it = pool.capture_reusable.find(capture_id);
+  if (it == pool.capture_reusable.end()) {
+    return nullptr;
+  }
+  auto block_it = it->second.lower_bound(&params.search_key);
+  while (block_it != it->second.end() && (*block_it)->heap->dedicated != params.dedicated) {
+    ++block_it;
+  }
+  if (block_it == it->second.end() || (*block_it)->size - params.size() >= pool.min_split) {
+    return nullptr;
+  }
+  BufferBlock* block = *block_it;
+  it->second.erase(block_it);
+  // Still pinned and still counted as allocated: it only comes back into use.
+  m_capture_pinned.at((__bridge const void*)block->buffer).freed_block = nullptr;
+  block->requested_size = params.requested_size;
+  block->shape.clear();
+  block->use_count++;
+  return block;
 }
 
 bool MPSHeapAllocatorImpl::insert_available_buffer(BufferPool& pool, BufferBlock* buffer_block) {
@@ -590,6 +621,13 @@ void MPSHeapAllocatorImpl::free_buffer(BufferBlock* buffer_block) {
   if (!m_capture_pinned.empty()) {
     if (auto it = m_capture_pinned.find((__bridge const void*)buffer_block->buffer); it != m_capture_pinned.end()) {
       it->second.freed_block = buffer_block;
+      // Allocated, bound and freed by a capture that is still recording, and bound by no other capture: replay runs
+      // that capture's work in the order it was recorded, so its later allocations may take this buffer as eager
+      // execution would, instead of each binding a buffer of its own (reuse_capture_buffer).
+      if (buffer_block->capture_id != 0 && it->second.count == 1 && !buffer_block->event &&
+          buffer_block->stream_uses.empty() && buffer_block->stream->activeCaptureId() == buffer_block->capture_id) {
+        buffer_block->heap->pool->capture_reusable[buffer_block->capture_id].insert(buffer_block);
+      }
       return;
     }
   }
@@ -868,6 +906,13 @@ void MPSHeapAllocatorImpl::unpinBufferForCapture(const void* ptr) {
   BufferBlock* freed_block = it->second.freed_block;
   m_capture_pinned.erase(it);
   if (freed_block) {
+    auto& reusable = freed_block->heap->pool->capture_reusable;
+    if (auto r = reusable.find(freed_block->capture_id); r != reusable.end()) {
+      r->second.erase(freed_block);
+      if (r->second.empty()) {
+        reusable.erase(r);
+      }
+    }
     free_buffer(freed_block);
   }
 }

@@ -16452,6 +16452,48 @@ torch.testing.assert_close(out, torch._weight_int8pack_mm(x2, w, scales))
         self.assertEqual(out, torch.full(shape, 9.0, device="mps"))
         self.assertEqual(picked, torch.tensor([5.0, 9.0, 1.0, 30.0], device="mps"))
 
+    def test_capture_reuses_buffers_freed_inside_it(self):
+        # A buffer the capture allocated and freed goes to that capture's own later
+        # allocations, as in eager, and still stays out of the pool afterwards.
+        shape = (67, 59)  # odd size, so no other test's cached block fits it exactly
+        x = torch.full(shape, 2.0, device="mps")
+        g = torch.accelerator.Graph()
+        with g:
+            a = x * 3
+            ptr = a.data_ptr()
+            b = a + 1
+            del a
+            c = b * 2
+            reused = c.data_ptr() == ptr
+            out = c - x
+            del b, c
+        self.assertTrue(reused)
+        squatters = [torch.full(shape, 7.0, device="mps") for _ in range(32)]
+        self.assertNotIn(ptr, [t.data_ptr() for t in squatters])
+        x.fill_(5.0)
+        out.fill_(float("nan"))
+        g.replay()
+        self.assertEqual(out, torch.full(shape, 27.0, device="mps"))
+        for t in squatters:
+            self.assertEqual(t, torch.full(shape, 7.0, device="mps"))
+
+    def test_capture_keeps_buffers_allocated_before_it(self):
+        # Replay still reads a buffer from before the capture that was freed inside
+        # it, so the capture's own allocations must not take it.
+        shape = (71, 53)
+        src = torch.full(shape, 3.0, device="mps")
+        ptr = src.data_ptr()
+        g = torch.accelerator.Graph()
+        with g:
+            h = src * 2
+            del src
+            out = h + 1
+        self.assertNotEqual(out.data_ptr(), ptr)
+        for _ in range(2):
+            out.fill_(float("nan"))
+            g.replay()
+            self.assertEqual(out, torch.full(shape, 7.0, device="mps"))
+
     def test_scalar_operands(self):
         # A Python scalar is recorded as bytes, so replay reuses its value; a 0-dim
         # MPS tensor is a buffer like any other input.
