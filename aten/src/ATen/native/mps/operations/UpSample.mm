@@ -161,11 +161,20 @@ static void dispatch_plane_grid(const std::string& name,
     return;
   }
   const auto& owner = grid_over_a ? a : b;
+  const auto& source = grid_over_a ? b : a;
   const UpsampleParams<4> params(a, b, align_corners, scales);
   const bool channels_last = owner.suggest_memory_format() == MemoryFormat::ChannelsLast;
   const auto height = static_cast<NSUInteger>(owner.size(2));
   const auto width = static_cast<NSUInteger>(owner.size(3));
   const auto all_planes = static_cast<NSUInteger>(owner.size(0) * owner.size(1));
+  // A dense owner can read a source with its planes innermost: 1d outputs and grad_inputs are allocated contiguous,
+  // so a C-fastest 1d input or grad_output gets here, as do 2d views that are C-fastest but not channels_last. Each
+  // cache line of such a source holds several planes, which the dense launch reads from a different threadgroup for
+  // every plane in the grid. The dense launch stays faster below 8 planes, for owners at most one narrow threadgroup
+  // wide (it already packs many planes per threadgroup), and for the 2d gather backward.
+  const auto plane_stride = source.size(1) > 1 ? source.stride(1) : source.stride(0);
+  const bool planes_inner = !channels_last && plane_stride < source.stride(3) && all_planes >= 8 &&
+      width > PLANE_GRID_PLANES_INNER_TG_WIDTH && (height == 1 || !grid_over_a);
   const c10::IntDivider<uint32_t> channels(static_cast<uint32_t>(owner.size(1)));
   static const auto core_count = std::max(MPSDevice::getInstance()->getCoreCount(), 1u);
   auto stream = getCurrentMPSStream();
@@ -178,14 +187,21 @@ static void dispatch_plane_grid(const std::string& name,
       const auto simd_width = [pso threadExecutionWidth];
       // Grid threads before (n, c) planes fold into per-thread loops; fewer would starve the GPU.
       const auto threads_in_flight = core_count * max_threads * PLANE_GRID_TGS_PER_CORE;
+      // With the planes innermost, round up to the planes of one 64-column threadgroup instead of a simdgroup, so that
+      // a thread reuses each line it reads for the planes it loops over.
+      const NSUInteger plane_multiple =
+          planes_inner ? PLANE_GRID_TARGET_TG_THREADS / PLANE_GRID_PLANES_INNER_TG_WIDTH : simd_width;
       const auto planes =
-          std::min(all_planes, at::round_up(at::ceil_div(threads_in_flight, height * width), simd_width));
+          std::min(all_planes, at::round_up(at::ceil_div(threads_in_flight, height * width), plane_multiple));
       // channels_last keeps each simdgroup on adjacent channels (threads are numbered x-first), unless there are
       // fewer planes than a simdgroup; then widen along x so threadgroups aren't just a handful of threads.
       const auto tg_planes = std::min(planes, max_threads);
       const auto cl_width = tg_planes < simd_width ? PLANE_GRID_TARGET_TG_THREADS / tg_planes : 1;
-      const auto tg_width = std::min<NSUInteger>({width, channels_last ? cl_width : max_threads, max_threads});
-      const auto threadgroup = MTLSizeMake(tg_width, 1, std::min(tg_planes, max_threads / tg_width));
+      const auto dense_width = planes_inner ? PLANE_GRID_PLANES_INNER_TG_WIDTH : max_threads;
+      const auto tg_width = std::min<NSUInteger>({width, channels_last ? cl_width : dense_width, max_threads});
+      const auto tg_threads =
+          std::min<NSUInteger>(planes_inner ? PLANE_GRID_TARGET_TG_THREADS : max_threads, max_threads);
+      const auto threadgroup = MTLSizeMake(tg_width, 1, std::min(tg_planes, tg_threads / tg_width));
       auto encoder = stream->commandEncoder();
       [encoder setComputePipelineState:pso];
       // Metal truncates grid sizes to 32 bits: tile larger H or W and pass each tile's origin.

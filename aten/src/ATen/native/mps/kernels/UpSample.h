@@ -12,8 +12,12 @@
 // loops; measured knee on M-series GPUs.
 C10_METAL_CONSTEXPR uint32_t PLANE_GRID_TGS_PER_CORE = 16;
 // Target threadgroup size when a channels_last plane grid has fewer planes than
-// a simdgroup and widens along x.
+// a simdgroup and widens along x, and when a dense plane grid reads a source
+// with its planes innermost.
 C10_METAL_CONSTEXPR uint32_t PLANE_GRID_TARGET_TG_THREADS = 256;
+// Threadgroup width when a dense plane grid reads a source with its planes
+// innermost, so that a few planes share the cache lines they read.
+C10_METAL_CONSTEXPR uint32_t PLANE_GRID_PLANES_INNER_TG_WIDTH = 64;
 
 template <unsigned N = 5>
 struct UpsampleParams {

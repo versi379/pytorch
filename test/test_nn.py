@@ -9583,17 +9583,27 @@ class TestNNDeviceType(NNTestCase):
         expected_out = expected_out.to(device=device)
         self.assertEqual(out_t, expected_out)
 
-    @parametrize_test("shape, output_width", [
-        ((0, 2, 4), 12),
-        ((2, 3, 4), 12),
-        ((2, 3, 32768), 65536),
+    @parametrize_test("shape, output_width, channels_fastest", [
+        ((0, 2, 4), 12, False),
+        ((2, 3, 4), 12, False),
+        ((2, 3, 32768), 65536, False),
+        ((2, 8, 1024), 2048, True),
     ])
-    def test_upsamplingLinear1d_kernel_paths(self, device, shape, output_width):
+    def test_upsamplingLinear1d_kernel_paths(self, device, shape, output_width, channels_fastest):
         # The CUDA/ROCm implementation picks between an unrolled kernel and the
         # original one based on ceil_div(output_width, 512), so output widths on
         # either side of 512 * 128 exercise different kernels. An empty batch dim
         # (the only empty dim the op accepts) used to launch a zero-block grid.
-        x = torch.randn(shape, device=device, requires_grad=True)
+        # MPS launches differently when the input or grad_output has the
+        # channels innermost.
+        n, c, w = shape
+        if channels_fastest:
+            x = torch.randn(n, w, c, device=device).transpose(1, 2)
+            grad_cpu = torch.randn(n, output_width, c).transpose(1, 2)
+        else:
+            x = torch.randn(shape, device=device)
+            grad_cpu = torch.randn(n, c, output_width)
+        x.requires_grad_()
         x_cpu = x.detach().cpu().requires_grad_()
 
         out = F.interpolate(x, size=output_width, mode="linear", align_corners=False)
@@ -9601,10 +9611,18 @@ class TestNNDeviceType(NNTestCase):
         self.assertEqual(out.shape, (shape[0], shape[1], output_width))
         self.assertEqual(out.cpu(), out_cpu)
 
-        grad_cpu = torch.randn_like(out_cpu)
         out.backward(grad_cpu.to(device))
         out_cpu.backward(grad_cpu)
         self.assertEqual(x.grad.cpu(), x_cpu.grad)
+
+        # NaN-filled outputs fail wherever no thread writes.
+        out_nan = torch.full_like(out, float("nan"))
+        torch.ops.aten.upsample_linear1d.out(x.detach(), [output_width], False, out=out_nan)
+        self.assertEqual(out_nan.cpu(), out_cpu)
+        grad_input = torch.full(shape, float("nan"), device=device)
+        torch.ops.aten.upsample_linear1d_backward.grad_input(
+            grad_cpu.to(device), [output_width], list(shape), False, grad_input=grad_input)
+        self.assertEqual(grad_input.cpu(), x_cpu.grad)
 
     @onlyCUDA
     @dtypes(torch.double, torch.float, torch.half, torch.bfloat16)
