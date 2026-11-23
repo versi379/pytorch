@@ -1839,7 +1839,7 @@ def use_deterministic_algorithms(
         * :class:`torch.nn.MaxPool3d` when attempting to differentiate a CUDA tensor
         * :func:`torch.nn.functional.interpolate` with ``mode='bilinear'`` and ``antialias=False``
           when attempting to differentiate a CUDA tensor
-        * :class:`torch.nn.Embedding` when attempting to differentiate a CUDA tensor
+        * :class:`torch.nn.Embedding` when attempting to differentiate a CUDA or MPS tensor
         * :func:`torch.Tensor.scatter_reduce` when called on MPS tensor
         * :func:`torch.Tensor.index_reduce` with ``reduce='prod'\'mean'``
           when called on an MPS tensor with floating or complex dtype
@@ -1889,7 +1889,6 @@ def use_deterministic_algorithms(
         * :func:`torch.Tensor.index_put` with ``accumulate=True`` when called on
           an MPS tensor with floating or complex dtype
         * :func:`torch.kthvalue` when called on an MPS tensor
-        * :class:`torch.nn.Embedding` when attempting to differentiate an MPS tensor
         * :class:`torch.nn.EmbeddingBag` when attempting to differentiate an MPS tensor
         * :func:`torch.Tensor.resize_` when called with a quantized tensor
 

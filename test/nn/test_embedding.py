@@ -847,7 +847,6 @@ class TestEmbeddingNNDeviceType(NNTestCase):
                 )
 
     @onlyAccelerator
-    @expectedFailureMPS  # https://github.com/pytorch/pytorch/issues/97236
     @dtypes(
         *(
             (torch.float, torch.double, torch.bfloat16, torch.half)

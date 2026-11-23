@@ -12,3 +12,12 @@ struct EmbeddingDenseBackwardParams {
   int64_t padding_idx;
   bool scale_grad_by_freq;
 };
+
+C10_METAL_CONSTEXPR uint32_t kEmbeddingBackwardRowsPerTile = 32;
+
+struct EmbeddingDenseBackwardSortedParams {
+  int64_t padding_idx;
+  uint32_t num_indices;
+  uint32_t feature_size;
+  bool scale_grad_by_freq;
+};

@@ -1,5 +1,6 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/Context.h>
+#include <ATen/ceil_div.h>
 #include <ATen/core/Tensor.h>
 #include <ATen/native/CanUse32BitIndexMath.h>
 #include <ATen/native/Pool.h>
@@ -15,6 +16,8 @@
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/embedding_dense_backward_native.h>
+#include <ATen/ops/empty.h>
+#include <ATen/ops/sort.h>
 #include <ATen/ops/zeros.h>
 #endif
 
@@ -26,16 +29,52 @@ static auto& lib = mps::MetalShaderLibrary::getBundledLibrary();
 #include <ATen/native/mps/Embedding_metallib.h>
 #endif
 
+// Sums each run of equal sorted indices in a fixed order, instead of the atomic
+// adds of the default path whose order varies between runs.
+static Tensor embedding_dense_backward_deterministic(const Tensor& grad_,
+                                                     const Tensor& indices,
+                                                     int64_t num_weights,
+                                                     int64_t padding_idx,
+                                                     bool scale_grad_by_freq) {
+  using namespace at::native::mps;
+  const auto num_indices = indices.numel();
+  const auto D = grad_.size(-1);
+  const auto grad = grad_.contiguous();
+  // Stable, so rows sharing an index keep their order and are summed the same way on every run
+  Tensor sorted_indices, positions;
+  std::tie(sorted_indices, positions) =
+      at::sort(indices.reshape(-1).to(kInt), /*stable=*/true, /*dim=*/0, /*descending=*/false);
+  auto grad_weight = at::zeros({num_weights, D}, grad_.options());
+  const auto num_tiles = at::ceil_div<int64_t>(num_indices, kEmbeddingBackwardRowsPerTile);
+  auto partials = at::empty({2 * num_tiles, D}, grad_.options().dtype(kFloat));
+  EmbeddingDenseBackwardSortedParams params{
+      padding_idx, static_cast<uint32_t>(num_indices), static_cast<uint32_t>(D), scale_grad_by_freq};
+
+  auto stream = getCurrentMPSStream();
+  const auto type_str = scalarToMetalTypeString(grad_);
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = stream->commandEncoder();
+      auto tile_pso = lib.getPipelineStateForFunc(fmt::format("embedding_dense_backward_sorted_{}", type_str));
+      [computeEncoder setComputePipelineState:tile_pso];
+      mtl_setArgs(computeEncoder, grad, sorted_indices, positions, grad_weight, partials, params);
+      mtl_dispatch2DJob(computeEncoder, tile_pso, D, num_tiles);
+
+      auto carry_pso = lib.getPipelineStateForFunc(fmt::format("embedding_dense_backward_sorted_carry_{}", type_str));
+      [computeEncoder setComputePipelineState:carry_pso];
+      mtl_setArgs(computeEncoder, sorted_indices, grad_weight, partials, params);
+      mtl_dispatch2DJob(computeEncoder, carry_pso, D, num_tiles);
+    }
+  });
+  return grad_weight;
+}
+
 Tensor embedding_dense_backward_mps(const Tensor& grad_,
                                     const Tensor& indices,
                                     int64_t num_weights,
                                     int64_t padding_idx,
                                     bool scale_grad_by_freq) {
   using namespace at::native::mps;
-
-  // See Note [Writing Nondeterministic Operations]
-  // Nondeterministic due to atomic_add
-  at::globalContext().alertNotDeterministic("embedding_dense_backward_mps");
 
   auto indices_arg = TensorArg(indices, "indices", 2);
   checkScalarTypes("embedding_backward", indices_arg, {kLong, kInt});
@@ -49,9 +88,6 @@ Tensor embedding_dense_backward_mps(const Tensor& grad_,
   if (num_indices == 0 || D == 0 || num_weights == 0) {
     return at::zeros({num_weights, D}, grad_.options());
   }
-
-  // Accumulate into float for stable precision
-  auto grad_weight_acc = at::zeros({num_weights, D}, grad_.options().dtype(low_prec ? kFloat : grad_.scalar_type()));
 
   auto outer_ndim = indices.dim();
   TORCH_CHECK(grad_.dim() == outer_ndim + 1,
@@ -68,6 +104,14 @@ Tensor embedding_dense_backward_mps(const Tensor& grad_,
   TORCH_CHECK(std::in_range<int32_t>(num_indices) && std::in_range<int32_t>(num_indices * D) &&
                   std::in_range<int32_t>(num_weights * D),
               "embedding_dense_backward_mps: tensor is larger than INT32_MAX");
+
+  // See Note [Enabling Deterministic Operations]
+  if (at::globalContext().deterministicAlgorithms()) {
+    return embedding_dense_backward_deterministic(grad_, indices, num_weights, padding_idx, scale_grad_by_freq);
+  }
+
+  // Accumulate into float for stable precision
+  auto grad_weight_acc = at::zeros({num_weights, D}, grad_.options().dtype(low_prec ? kFloat : grad_.scalar_type()));
 
   EmbeddingDenseBackwardParams<uint32_t> params{};
   params.outer_ndim = static_cast<uint32_t>(outer_ndim);

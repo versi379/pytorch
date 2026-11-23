@@ -13946,10 +13946,17 @@ class TestAdvancedIndexing(TestCaseMPS):
 class TestNondeterministic(TestCaseMPS):
     def _case_embedding_dense_backward(self, device):
         weight = torch.randn(10, 3, device=device, requires_grad=True)
-        idx = torch.tensor([1, 2, 3, 1], device=device)
+        idx = torch.randint(0, 10, (1000,), device=device)
         res = F.embedding(idx, weight)
-        grad = torch.ones_like(res)
-        return lambda: res.backward(grad)
+        grad = torch.randn_like(res)
+        return lambda: torch.autograd.grad(res, weight, grad, retain_graph=True)[0]
+
+    def _case_embedding_dense_backward_padding_scale(self, device):
+        weight = torch.randn(10, 3, device=device, requires_grad=True)
+        idx = torch.randint(0, 10, (1000,), device=device)
+        res = F.embedding(idx, weight, padding_idx=0, scale_grad_by_freq=True)
+        grad = torch.randn_like(res)
+        return lambda: torch.autograd.grad(res, weight, grad, retain_graph=True)[0]
 
     def _case_embedding_bag_dense_backward(self, device):
         weight = torch.randn(10, 3, device=device, requires_grad=True)
@@ -14163,9 +14170,6 @@ class TestNondeterministic(TestCaseMPS):
     # builder method must return a callable which, when called, will exercise
     # the nondeterministic alert.
     ALERT_CASES = {
-        "embedding_dense_backward": (
-            _case_embedding_dense_backward, "embedding_dense_backward_mps"
-        ),
         "embedding_bag_dense_backward": (
             _case_embedding_bag_dense_backward, "_embedding_bag_dense_backward_mps"
         ),
@@ -14209,6 +14213,8 @@ class TestNondeterministic(TestCaseMPS):
         "scatter_reduce": _case_scatter_reduce,
         "scatter_reduce_strided": _case_scatter_reduce_strided,
         "index_reduce": _case_index_reduce,
+        "embedding_dense_backward": _case_embedding_dense_backward,
+        "embedding_dense_backward_padding_scale": _case_embedding_dense_backward_padding_scale,
     }
 
     @parametrize("case_name", list(DETERMINISTIC_CASES.keys()))
