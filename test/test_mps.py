@@ -4653,6 +4653,14 @@ class TestMPS(TestCaseMPS):
         helper([9.0, 3.0, 5.0, 4.0], torch.CharTensor)
         helper([9.0, 3.0, 5.0, 4.0], torch.ByteTensor)
 
+    def test_type_string_raises(self):
+        # https://github.com/pytorch/pytorch/issues/78929
+        x = torch.ones(3, device="mps")
+        with self.assertRaisesRegex(ValueError, "MPS has no legacy tensor types"):
+            x.type(x.type())
+        with self.assertRaisesRegex(ValueError, "MPS has no legacy tensor types"):
+            x.cpu().type("torch.mps.HalfTensor")
+
     def test_to_casting(self):
         # https://github.com/pytorch/pytorch/issues/81567
         def helper(data, to_dtype):

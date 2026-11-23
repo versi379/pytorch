@@ -106,6 +106,13 @@ at::TensorOptions options_from_string(const std::string& str) {
     static const auto xpu_map =
         build_type_map(autograd::VariableType::allXPUTypes());
     map = &xpu_map;
+  } else if (str.starts_with("torch.mps.")) {
+    TORCH_CHECK_VALUE(
+        false,
+        "invalid type: '",
+        str,
+        "'. MPS has no legacy tensor types, pass a dtype instead, ",
+        "e.g. tensor.type(torch.float32) or tensor.to('mps', torch.float32)");
   } else if (str.starts_with(privateUser_prefix)) {
     static const auto privateUser1_map =
         build_type_map(autograd::VariableType::allPrivateUser1Types());
