@@ -445,9 +445,9 @@ inline float2 pow(T a, U b) {
   const auto new_r = ::metal::precise::exp(b.x * log_r - b.y * theta);
   const auto new_theta = b.x * theta + b.y * log_r;
 
-  return float2(
-      new_r * ::metal::precise::cos(new_theta),
-      new_r * ::metal::precise::sin(new_theta));
+  float cos_theta;
+  const float sin_theta = ::metal::precise::sincos(new_theta, cos_theta);
+  return float2(new_r * cos_theta, new_r * sin_theta);
 }
 
 // Integral pow - unsigned types

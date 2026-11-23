@@ -369,7 +369,9 @@ struct polar_functor {
   using ret_type = c10::metal::vec2type_t<U>;
   template <typename T>
   inline ret_type<T> operator()(const T a, const T b) {
-    return ret_type<T>(a * cos(b), a * sin(b));
+    float c;
+    const float s = precise::sincos(static_cast<float>(b), c);
+    return ret_type<T>(a * static_cast<T>(c), a * static_cast<T>(s));
   }
 };
 

@@ -749,10 +749,9 @@ inline ::metal::enable_if_t<is_complex_v<T>, T> logaddexp(T a, T b) {
   float2 maxval_ = static_cast<float2>(maxval);
   float2 minval_ = static_cast<float2>(minval);
   float m = ::metal::exp(minval_.x - maxval_.x);
-  float2 dexp{
-      m * ::metal::cos(minval_.y - maxval_.y),
-      m * ::metal::sin(minval_.y - maxval_.y),
-  };
+  float cos_d;
+  const float sin_d = ::metal::precise::sincos(minval_.y - maxval_.y, cos_d);
+  float2 dexp{m * cos_d, m * sin_d};
   return static_cast<T>(maxval_ + ::c10::metal::log1p(dexp));
 }
 
@@ -928,12 +927,10 @@ inline float bessel_j0_forward(T x_) {
     qq = qq * (25.0 / (x * x)) + QQ[index];
   }
 
-  return (pp / pq *
-              ::metal::precise::cos(
-                  x - 0.785398163397448309615660845819875721) -
-          5.0 / x * (qp / qq) *
-              ::metal::precise::sin(
-                  x - 0.785398163397448309615660845819875721)) *
+  float cos_xn;
+  const float sin_xn = ::metal::precise::sincos(
+      x - 0.785398163397448309615660845819875721, cos_xn);
+  return (pp / pq * cos_xn - 5.0 / x * (qp / qq) * sin_xn) *
       0.797884560802865355879892119868763737 / ::metal::precise::sqrt(x);
 } // bessel_j0_forward(T x)
 
@@ -1052,12 +1049,10 @@ inline float bessel_y0_forward(T x_) {
     qq = qq * (25.0 / (x * x)) + QQ[index];
   }
 
-  return (pp / pq *
-              ::metal::precise::sin(
-                  x - 0.785398163397448309615660845819875721) +
-          5.0 / x * (qp / qq) *
-              ::metal::precise::cos(
-                  x - 0.785398163397448309615660845819875721)) *
+  float cos_xn;
+  const float sin_xn = ::metal::precise::sincos(
+      x - 0.785398163397448309615660845819875721, cos_xn);
+  return (pp / pq * sin_xn + 5.0 / x * (qp / qq) * cos_xn) *
       0.797884560802865355879892119868763737 / ::metal::precise::sqrt(x);
 } // bessel_y0_forward(T x)
 
@@ -1168,12 +1163,10 @@ inline float bessel_j1_forward(T x_) {
     qq = qq * (5.0 / x * (5.0 / x)) + QQ[index];
   }
 
-  return (pp / pq *
-              ::metal::precise::cos(
-                  x - 2.356194490192344928846982537459627163) -
-          5.0 / x * (qp / qq) *
-              ::metal::precise::sin(
-                  x - 2.356194490192344928846982537459627163)) *
+  float cos_xn;
+  const float sin_xn = ::metal::precise::sincos(
+      x - 2.356194490192344928846982537459627163, cos_xn);
+  return (pp / pq * cos_xn - 5.0 / x * (qp / qq) * sin_xn) *
       0.797884560802865355879892119868763737 / ::metal::precise::sqrt(x);
 } // bessel_j1_forward(T x)
 
@@ -1291,12 +1284,10 @@ inline float bessel_y1_forward(T x_) {
     qq = qq * (5.0 / x * (5.0 / x)) + QQ[index];
   }
 
-  return (pp / pq *
-              ::metal::precise::sin(
-                  x - 2.356194490192344928846982537459627163) +
-          5.0 / x * (qp / qq) *
-              ::metal::precise::cos(
-                  x - 2.356194490192344928846982537459627163)) *
+  float cos_xn;
+  const float sin_xn = ::metal::precise::sincos(
+      x - 2.356194490192344928846982537459627163, cos_xn);
+  return (pp / pq * sin_xn + 5.0 / x * (qp / qq) * cos_xn) *
       0.797884560802865355879892119868763737 / ::metal::precise::sqrt(x);
 } // bessel_y1_forward(T x)
 
@@ -3311,10 +3302,11 @@ inline float airy_ai_forward(T x_) {
 
     const float t = -2.0 * x * ::metal::precise::sqrt(-x) / 3.0 + 0.25 * M_PI_F;
 
+    float cos_t;
+    const float sin_t = ::metal::precise::sincos(t, cos_t);
     return 5.64189583547756286948e-01 /
         ::metal::precise::sqrt(::metal::precise::sqrt(-x)) *
-        (::metal::precise::sin(t) * (1.0 + z * z * afn / afd) -
-         ::metal::precise::cos(t) * (z * agn / agd));
+        (sin_t * (1.0 + z * z * afn / afd) - cos_t * (z * agn / agd));
   }
 
   if (x >= 2.09) {
