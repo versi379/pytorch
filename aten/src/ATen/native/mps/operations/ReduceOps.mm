@@ -906,6 +906,11 @@ static void sum_nansum_kernel_mps(TensorIterator& iter, const std::string& kerne
   if (output.numel() == 0) {
     return;
   }
+  // Only size-1 dims are reduced, so sum and mean (divisor 1) are a cast copy
+  if (kernel_prefix == "sum_" && input.numel() == output.numel()) {
+    output.copy_(input);
+    return;
+  }
   // Pass 2 always sums partials (count_nonzero's partials are per-block
   // counts -- counting again would be wrong, so always use sum_).
   const ReductionOp op{/*is_arg=*/false, kernel_prefix, input.scalar_type(), output.scalar_type(), divisor};
