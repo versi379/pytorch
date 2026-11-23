@@ -1698,6 +1698,7 @@ torch_c_binding_in_graph_functions = dict.fromkeys(
         "torch._fw_primal_copy",
         "torch._grid_sampler_2d_cpu_fallback",
         "torch._grouped_mm",
+        "torch._gru_mps",
         "torch._histogramdd_bin_edges",
         "torch._histogramdd_from_bin_cts",
         "torch._histogramdd_from_bin_tensors",

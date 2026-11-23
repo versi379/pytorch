@@ -398,6 +398,8 @@ aten::_grid_sampler_2d_cpu_fallback.out
 aten::_grid_sampler_2d_cpu_fallback_backward
 aten::_grouped_mm
 aten::_grouped_mm.out
+aten::_gru_mps
+aten::_gru_mps.out
 aten::_has_same_storage_numel
 aten::_histogramdd_bin_edges
 aten::_histogramdd_bin_edges.out
@@ -870,6 +872,8 @@ aten::grid_sampler_3d
 aten::grid_sampler_3d.out
 aten::grid_sampler_3d_backward
 aten::grid_sampler_3d_backward.out
+aten::gru_mps_backward
+aten::gru_mps_backward.out
 aten::hamming_window
 aten::hamming_window.out
 aten::hamming_window.periodic

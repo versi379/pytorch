@@ -9,10 +9,12 @@
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
 #else
+#include <ATen/ops/_gru_mps_native.h>
 #include <ATen/ops/_lstm_mps_native.h>
 #include <ATen/ops/addmm.h>
 #include <ATen/ops/cat.h>
 #include <ATen/ops/empty.h>
+#include <ATen/ops/gru_mps_backward_native.h>
 #include <ATen/ops/lstm_mps_backward_native.h>
 #include <ATen/ops/mm.h>
 #include <ATen/ops/zeros.h>
@@ -214,5 +216,157 @@ std::tuple<Tensor, std::vector<Tensor>, std::vector<Tensor>> lstm_mps_backward(c
   return {batch_first ? grad_y.transpose(0, 1).contiguous() : std::move(grad_y),
           {std::move(grad_h), std::move(grad_c)},
           std::move(grad_params)};
+}
+
+std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> _gru_mps(const Tensor& input,
+                                                            const Tensor& hx,
+                                                            TensorList params,
+                                                            bool has_biases,
+                                                            int64_t num_layers,
+                                                            double dropout_p,
+                                                            bool train,
+                                                            bool bidirectional,
+                                                            bool batch_first) {
+  check_attributes(input, params, hx, true);
+  TORCH_CHECK_TYPE(
+      supportedFloatingType(input), "GRU on MPS supports float32, float16 and bfloat16, got ", input.scalar_type());
+  auto layer_input = (batch_first ? input.transpose(0, 1) : input).contiguous();
+  const auto seq_len = layer_input.size(0), batch = layer_input.size(1), hidden = hx.size(2);
+  const int64_t directions = bidirectional ? 2 : 1;
+  const int64_t stride = has_biases ? 4 : 2;
+  const int64_t gate_size = kGruGates * hidden;
+  TORCH_CHECK(seq_len > 0, "Expected sequence length to be larger than 0 in RNN");
+  const bool dropout = train && dropout_p > 0 && num_layers > 1;
+  // Each step takes its input gates from the workspace and overwrites them with what backward needs.
+  auto workspace = at::empty({num_layers * directions, seq_len, batch, kGruWorkspace * hidden}, input.options());
+  // Keep the initial state followed by each recurrent step for backward.
+  auto states = at::empty({num_layers * directions, seq_len + 1, batch, hidden}, input.options());
+  auto layers = at::empty({(num_layers - 1) * (dropout ? 2 : 1), seq_len, batch, directions * hidden}, input.options());
+  auto hy = at::empty(hx.sizes(), input.options());
+  auto recurrent_gates = at::empty({batch, gate_size}, input.options());
+  const auto no_bias = has_biases ? Tensor() : at::zeros({gate_size}, input.options());
+  auto pso = lib.getPipelineStateForFunc(fmt::format(
+      "gru_cell_forward_{}{}", scalarToMetalTypeString(input), mtlIdxSuffix(offsetsFitIn<uint32_t>(workspace[0][0]))));
+  for (const auto layer : c10::irange(num_layers)) {
+    std::vector<Tensor> outputs;
+    outputs.reserve(directions);
+    for (const auto direction : c10::irange(directions)) {
+      const auto index = layer * directions + direction, param = index * stride;
+      TORCH_CHECK_VALUE(params[param].size(0) == gate_size && params[param + 1].size(0) == gate_size,
+                        "GRU weights must have ",
+                        gate_size,
+                        " rows, got ",
+                        params[param].sizes(),
+                        " and ",
+                        params[param + 1].sizes());
+      auto x = direction ? layer_input.flip({0}) : layer_input;
+      auto w = workspace[index], h = states[index];
+      auto input_gates = w.view({seq_len * batch, kGruWorkspace * hidden}).narrow(1, 0, gate_size);
+      lstm_mm(input_gates, x.reshape({seq_len * batch, x.size(2)}), params[param].t());
+      h[0].copy_(hx[index]);
+      const auto input_bias = has_biases ? params[param + 2].expand({gate_size}).contiguous() : no_bias;
+      const auto hidden_bias = has_biases ? params[param + 3].expand({gate_size}).contiguous() : no_bias;
+      const auto recurrent_weight = params[param + 1].contiguous().t();
+      for (const auto step : c10::irange(seq_len)) {
+        lstm_mm(recurrent_gates, h[step], recurrent_weight);
+        lstm_cell(pso, h[step], w[step], recurrent_gates, h[step], h[step + 1], input_bias, hidden_bias);
+      }
+      hy[index].copy_(h[seq_len]);
+      auto output = h.narrow(0, 1, seq_len);
+      outputs.push_back(direction ? output.flip({0}) : output);
+    }
+    layer_input = directions == 1 ? outputs[0] : at::cat(outputs, -1);
+    if (layer + 1 < num_layers) {
+      if (dropout) {
+        auto mask = layers[num_layers - 1 + layer];
+        mask.bernoulli_(1.0 - dropout_p).div_(dropout_p == 1.0 ? 1.0 : 1.0 - dropout_p);
+        layer_input = layer_input.mul(mask);
+      }
+      layers[layer].copy_(layer_input);
+    }
+  }
+  auto output = directions == 1 ? layer_input.clone() : std::move(layer_input);
+  if (batch_first) {
+    output = output.transpose(0, 1).contiguous();
+  }
+  return {std::move(output), std::move(hy), std::move(workspace), std::move(states), std::move(layers)};
+}
+
+std::tuple<Tensor, Tensor, std::vector<Tensor>> gru_mps_backward(const std::optional<Tensor>& grad_y_opt,
+                                                                 const std::optional<Tensor>& grad_hy_opt,
+                                                                 const Tensor& workspace,
+                                                                 const Tensor& states,
+                                                                 const Tensor& input,
+                                                                 const Tensor& layers,
+                                                                 const Tensor& hx,
+                                                                 TensorList params,
+                                                                 bool has_biases,
+                                                                 int64_t num_layers,
+                                                                 double dropout_p,
+                                                                 bool train,
+                                                                 bool bidirectional,
+                                                                 bool batch_first) {
+  // workspace: r, z, n and W_hn h + b_hn, [layers * directions, seq_len, batch, kGruWorkspace * hidden].
+  // states: hidden with the initial state, [layers * directions, seq_len + 1, batch, hidden].
+  auto x = (batch_first ? input.transpose(0, 1) : input).contiguous();
+  const auto seq_len = x.size(0), batch = x.size(1), hidden = hx.size(2);
+  const int64_t directions = bidirectional ? 2 : 1;
+  const int64_t stride = has_biases ? 4 : 2;
+  const int64_t gate_size = kGruGates * hidden;
+  const bool dropout = train && dropout_p > 0 && num_layers > 1;
+  auto grad_y = grad_y_opt.value_or(Tensor());
+  grad_y = grad_y.defined() ? (batch_first ? grad_y.transpose(0, 1) : grad_y)
+                            : at::zeros({seq_len, batch, directions * hidden}, input.options());
+  auto grad_h = grad_hy_opt.value_or(Tensor());
+  grad_h = grad_h.defined() ? grad_h.clone(MemoryFormat::Contiguous) : at::zeros(hx.sizes(), input.options());
+  std::vector<Tensor> grad_params(params.size());
+  auto dh_recurrent = at::empty({batch, hidden}, input.options());
+  auto pso = lib.getPipelineStateForFunc(fmt::format(
+      "gru_cell_backward_{}{}", scalarToMetalTypeString(input), mtlIdxSuffix(offsetsFitIn<uint32_t>(workspace[0][0]))));
+  for (int64_t layer = num_layers - 1; layer >= 0; --layer) {
+    const auto layer_input = layer == 0 ? x : layers[layer - 1];
+    auto grad_input = at::zeros_like(layer_input);
+    for (const auto direction : c10::irange(directions)) {
+      const auto index = layer * directions + direction, param = index * stride;
+      auto dy = grad_y.narrow(-1, direction * hidden, hidden);
+      dy = direction ? dy.flip({0}).contiguous() : dy.contiguous();
+      const auto h = states[index], w = workspace[index];
+      auto dh = grad_h[index];
+      auto dgi = at::empty({seq_len, batch, gate_size}, input.options()), dgh = at::empty_like(dgi);
+      const auto recurrent_weight = params[param + 1].contiguous();
+      dh_recurrent.zero_();
+      for (int64_t step = seq_len - 1; step >= 0; --step) {
+        lstm_cell(pso, dh, w[step], h[step], dy[step], dh_recurrent, dh, dgi[step], dgh[step]);
+        lstm_mm(dh_recurrent, dgh[step], recurrent_weight);
+      }
+      dh.add_(dh_recurrent);
+      auto dgi_flat = dgi.view({seq_len * batch, gate_size});
+      const auto dgh_flat = dgh.view({seq_len * batch, gate_size});
+      const auto input_size = layer_input.size(2);
+      grad_params[param + 1] = at::empty({gate_size, hidden}, input.options());
+      lstm_mm(grad_params[param + 1], dgh_flat.t(), h.narrow(0, 0, seq_len).reshape({seq_len * batch, hidden}));
+      if (direction) {
+        dgi_flat = dgi.flip({0}).view({seq_len * batch, gate_size});
+      }
+      grad_params[param] = at::empty({gate_size, input_size}, input.options());
+      lstm_mm(grad_params[param], dgi_flat.t(), layer_input.reshape({seq_len * batch, input_size}));
+      auto grad_input_flat = grad_input.view({seq_len * batch, input_size});
+      // grad_input starts at zero, so the first direction doesn't need to read it.
+      const auto beta = direction ? 1 : 0;
+      at::addmm_out(grad_input_flat, grad_input_flat, dgi_flat, params[param], beta);
+      if (has_biases) {
+        grad_params[param + 2] = dgi_flat.sum(0);
+        grad_params[param + 3] = dgh_flat.sum(0);
+      }
+    }
+    if (dropout && layer > 0) {
+      grad_input.mul_(layers[num_layers - 1 + layer - 1]);
+    }
+    grad_y = std::move(grad_input);
+  }
+  if (batch_first) {
+    grad_y = grad_y.transpose(0, 1).contiguous();
+  }
+  return {std::move(grad_y), std::move(grad_h), std::move(grad_params)};
 }
 } // namespace at::native

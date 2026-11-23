@@ -8975,7 +8975,6 @@ class TestNNDeviceType(NNTestCase):
             ], device=device)
             F.fold(tensor_data, 16, 7318349394477056)
 
-    @skipMPS  # MPS does not support float64
     @onlyAccelerator
     @dtypes(torch.float, torch.double)
     def test_rnn_fused(self, device, dtype):
@@ -11608,6 +11607,27 @@ class TestNNDeviceType(NNTestCase):
         (out.sum() + (h * c).sum()).backward()
         self.assertEqual(x.grad, x_cpu.grad, atol=1e-4, rtol=1e-4)
         for param, param_cpu in zip(lstm.parameters(), lstm_cpu.parameters()):
+            self.assertEqual(param.grad, param_cpu.grad, atol=1e-4, rtol=1e-4)
+
+    @onlyAccelerator
+    @dtypes(torch.double)
+    @dtypesIfMPS(torch.float)
+    @parametrize_test("batch_size,hidden_size", [(1, 7), (5, 513)])
+    def test_GRU_batch_and_hidden_sizes(self, device, dtype, batch_size, hidden_size):
+        gru_cpu = nn.GRU(11, hidden_size, num_layers=2, bidirectional=True, dtype=dtype)
+        gru = deepcopy(gru_cpu).to(device)
+        x_cpu = torch.randn(3, batch_size, 11, dtype=dtype, requires_grad=True)
+        h0_cpu = torch.randn(4, batch_size, hidden_size, dtype=dtype, requires_grad=True)
+        x = x_cpu.detach().to(device).requires_grad_()
+        h0 = h0_cpu.detach().to(device).requires_grad_()
+        out_cpu, h_cpu = gru_cpu(x_cpu, h0_cpu)
+        out, h = gru(x, h0)
+        self.assertEqual(out, out_cpu, atol=1e-4, rtol=1e-4)
+        (out_cpu.sum() + (h_cpu * h_cpu).sum()).backward()
+        (out.sum() + (h * h).sum()).backward()
+        self.assertEqual(x.grad, x_cpu.grad, atol=1e-4, rtol=1e-4)
+        self.assertEqual(h0.grad, h0_cpu.grad, atol=1e-4, rtol=1e-4)
+        for param, param_cpu in zip(gru.parameters(), gru_cpu.parameters()):
             self.assertEqual(param.grad, param_cpu.grad, atol=1e-4, rtol=1e-4)
 
     @skipMeta  # GRU cell reuses output which was resized

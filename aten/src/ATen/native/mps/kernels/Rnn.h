@@ -3,6 +3,9 @@
 #include <c10/metal/common.h>
 
 C10_METAL_CONSTEXPR uint32_t kLstmGates = 4;
+C10_METAL_CONSTEXPR uint32_t kGruGates = 3;
+// GRU keeps r, z, n and the recurrent part of n, W_hn h + b_hn, for backward.
+C10_METAL_CONSTEXPR uint32_t kGruWorkspace = kGruGates + 1;
 
 // Threads don't interact, so this only caps the threadgroup. Measured up to 7%
 // faster than the default of 1024.

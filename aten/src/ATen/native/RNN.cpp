@@ -27,6 +27,7 @@
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
 #else
+#include <ATen/ops/_gru_mps.h>
 #include <ATen/ops/_lstm_mps.h>
 #include <ATen/ops/_thnn_differentiable_gru_cell_backward_native.h>
 #include <ATen/ops/_thnn_differentiable_lstm_cell_backward_native.h>
@@ -1320,6 +1321,23 @@ inline void check_rnn_batch_sizes(const Tensor& batch_sizes) {
           bidirectional,                                                    \
           batch_first);                                                     \
       return std::make_tuple(std::move(output), std::move(hy));             \
+    }                                                                       \
+    if constexpr (std::is_same_v<CELL, GRUCell<CellParams>>) {              \
+      if (_input.is_mps() && !_input.is_complex()) {                        \
+        auto result = at::_gru_mps(                                         \
+            _input,                                                         \
+            hx,                                                             \
+            _params,                                                        \
+            has_biases,                                                     \
+            num_layers,                                                     \
+            dropout_p,                                                      \
+            train,                                                          \
+            bidirectional,                                                  \
+            batch_first);                                                   \
+        return std::make_tuple(                                             \
+            std::move(std::get<0>(result)),                                 \
+            std::move(std::get<1>(result)));                                \
+      }                                                                     \
     }                                                                       \
     if (use_miopen(_input, dropout_p)) {                                    \
       try {                                                                 \
