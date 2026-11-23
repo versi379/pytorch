@@ -96,15 +96,6 @@ void arange_range_fill_mps(const Scalar& start, const Scalar& step, Tensor& resu
   }
 }
 
-// float32 interpolation stays within one unit under 2^20; above it neighbours
-// collapse, e.g. every element of linspace(2^40, 2^40 + 8) rounds to 2^40.
-bool linspace_fits_float(int64_t start, int64_t end, int64_t steps) {
-  constexpr int64_t max_magnitude = 1 << 20;
-  constexpr int64_t max_exact_index = 1 << std::numeric_limits<float>::digits;
-
-  return std::max(start, end) < max_magnitude && std::min(start, end) > -max_magnitude && steps <= max_exact_index;
-}
-
 } // anonymous namespace
 
 Tensor& arange_mps_out(const Scalar& start, const Scalar& end, const Scalar& step, Tensor& result) {
@@ -188,34 +179,24 @@ Tensor& linspace_out_mps(const Scalar& start, const Scalar& end, int64_t steps, 
   }
 
   const auto dtype = result.scalar_type();
-  bool use_integral_kernel = false;
+  // float32 interpolation can land just below an integer, which truncation then
+  // drops by one, so integral dtypes use exact integer arithmetic.
+  const bool use_integral_kernel = isIntegralType(dtype, /*includeBool=*/false);
   std::array<uint64_t, 4> integral_params{};
   std::array<float, 3> vals{};
-  if (dtype == ScalarType::Long || dtype == ScalarType::Int) {
+  if (use_integral_kernel) {
     AT_DISPATCH_INTEGRAL_TYPES(dtype, "linspace_mps", [&]() {
       const int64_t s = static_cast<int64_t>(start.to<scalar_t>());
       const int64_t e = static_cast<int64_t>(end.to<scalar_t>());
-      use_integral_kernel = !linspace_fits_float(s, e, steps);
-      if (use_integral_kernel) {
-        const uint64_t distance = e >= s ? static_cast<uint64_t>(e) - static_cast<uint64_t>(s)
-                                         : static_cast<uint64_t>(s) - static_cast<uint64_t>(e);
-        const uint64_t denominator = static_cast<uint64_t>(steps - 1);
-        integral_params = {
-            static_cast<uint64_t>(s), static_cast<uint64_t>(e), distance / denominator, distance % denominator};
-      }
+      const uint64_t distance = e >= s ? static_cast<uint64_t>(e) - static_cast<uint64_t>(s)
+                                       : static_cast<uint64_t>(s) - static_cast<uint64_t>(e);
+      const uint64_t denominator = static_cast<uint64_t>(steps - 1);
+      integral_params = {
+          static_cast<uint64_t>(s), static_cast<uint64_t>(e), distance / denominator, distance % denominator};
     });
-  }
-  if (!use_integral_kernel) {
-    float s = 0, e = 0;
-    if (isIntegralType(dtype, /*includeBool=*/false)) {
-      AT_DISPATCH_INTEGRAL_TYPES(dtype, "linspace_mps", [&]() {
-        s = static_cast<float>(start.to<scalar_t>());
-        e = static_cast<float>(end.to<scalar_t>());
-      });
-    } else {
-      s = start.to<float>();
-      e = end.to<float>();
-    }
+  } else {
+    const float s = start.to<float>();
+    const float e = end.to<float>();
     vals = {s, (e - s) / static_cast<float>(steps - 1), e};
   }
 

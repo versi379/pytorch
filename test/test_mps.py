@@ -8780,6 +8780,11 @@ class TestMPS(TestCaseMPS):
         (torch.int64, 2**40, 2**40 + 8, 9),
         (torch.int64, -(2**40), -(2**40) + 8, 9),
         (torch.int64, 2**40 + 8, 2**40, 9),
+        # https://github.com/pytorch/pytorch/issues/137635
+        (torch.int8, 4.3, -3, 50),
+        (torch.int16, 4.3, -3, 50),
+        (torch.int32, 4.3, -3, 50),
+        (torch.uint8, 0, 7, 50),
     ])
     def test_linspace_integral_precision(self, dtype, start, end, steps):
         expected = torch.linspace(start, end, steps, dtype=dtype)
@@ -14773,9 +14778,6 @@ class TestConsistency(TestCaseMPS):
         if op.name in ['fft.hfftn', 'fft.hfft2', 'fft.hfft']:
             # float32 rounding at the scale of the unnormalized outputs: https://github.com/pytorch/pytorch/issues/120237
             return (3e-5, 3e-5)
-        # Integral linspace can differ from CPU by one due to interpolation rounding.
-        if op.name == 'linspace' and dtype in [torch.int8, torch.uint8, torch.int32, torch.int16, torch.int64]:
-            return (1.0, 0.0)
         if op.name == "index_reduce" and op.variant_test_name in ['mean', 'prod'] and dtype in [torch.float16, torch.bfloat16]:
             return (0.01, 0.01)
         # Migrating MPS rand/randn from MPSGraph to native Metal in #182386

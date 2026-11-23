@@ -26,7 +26,23 @@ inline T integral_linspace_value(
   const ulong position = static_cast<ulong>(from_start ? i : steps - i - 1);
   ulong offset = params[2] * position;
   bool has_fraction = false;
-  if (params[3] != 0) {
+  if (params[3] != 0 && denominator < (1 << 24)) {
+    // 64-bit division is slow, so estimate the quotient in float and correct
+    // it: the estimate is off by a few units at most, so the remainder fits in
+    // 32 bits even when the product does not.
+    const uint rem = params[3], pos = position, den = denominator;
+    uint quotient =
+        static_cast<uint>(fast::divide(float(rem) * float(pos), float(den)));
+    int remainder = as_type<int>(rem * pos - quotient * den);
+    for (; remainder < 0; remainder += int(den)) {
+      --quotient;
+    }
+    for (; remainder >= int(den); remainder -= int(den)) {
+      ++quotient;
+    }
+    offset += quotient;
+    has_fraction = remainder != 0;
+  } else if (params[3] != 0) {
     const ulong fractional_product = params[3] * position;
     offset += fractional_product / denominator;
     has_fraction = fractional_product % denominator != 0;
@@ -260,14 +276,12 @@ REGISTER_LINSPACE_OP(half);
 REGISTER_LINSPACE_OP(bfloat);
 REGISTER_LINSPACE_OP(float2);
 REGISTER_LINSPACE_OP(bool);
-REGISTER_LINSPACE_OP(short);
-REGISTER_LINSPACE_OP(char);
-REGISTER_LINSPACE_OP(uchar);
-REGISTER_LINSPACE_OP(long);
-REGISTER_LINSPACE_OP(int);
 
 REGISTER_INTEGRAL_LINSPACE_OP(long);
 REGISTER_INTEGRAL_LINSPACE_OP(int);
+REGISTER_INTEGRAL_LINSPACE_OP(short);
+REGISTER_INTEGRAL_LINSPACE_OP(char);
+REGISTER_INTEGRAL_LINSPACE_OP(uchar);
 
 REGISTER_LOGSPACE_OP(float);
 REGISTER_LOGSPACE_OP(half);
