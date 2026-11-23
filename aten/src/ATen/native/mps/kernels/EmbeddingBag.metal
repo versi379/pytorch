@@ -300,6 +300,7 @@ void embedding_bag_backward_sum_mean_impl(
     constant I* bag_size,
     device const T* per_sample_weights,
     device AtomicType_t<T>* weight_grad,
+    device const uint* counts,
     constant EmbeddingBagBackwardParams<uint32_t>& params,
     uint tid) {
   auto feature_size = params.feature_size;
@@ -329,6 +330,9 @@ void embedding_bag_backward_sum_mean_impl(
             per_sample_weights,
             per_sample_weights_stride),
         static_cast<opmath_t<T>>(bag_size_val));
+    if (params.scale_grad_by_freq) {
+      weight_grad_val /= static_cast<opmath_t<T>>(counts[weight_idx]);
+    }
 
     AtomicType<T>::atomic_add(
         weight_grad,
@@ -380,6 +384,7 @@ void embedding_bag_backward_max_impl(
       bag_size,                                      \
       per_sample_weights,                            \
       weight_grad,                                   \
+      counts,                                        \
       params,                                        \
       tid)
 
@@ -392,7 +397,8 @@ kernel void embedding_bag_backward(
     device const I* max_indices [[buffer(4)]],
     device const T* per_sample_weights [[buffer(5)]],
     device AtomicType_t<T>* weight_grad [[buffer(6)]],
-    constant EmbeddingBagBackwardParams<uint32_t>& params [[buffer(7)]],
+    device const uint* counts [[buffer(7)]],
+    constant EmbeddingBagBackwardParams<uint32_t>& params [[buffer(8)]],
     uint tid [[thread_position_in_grid]]) {
   switch (params.mode) {
     case EmbeddingBagMode::SUM:
@@ -402,6 +408,18 @@ kernel void embedding_bag_backward(
     case EmbeddingBagMode::MAX:
       return embedding_bag_backward_max_impl(
           output_grad, bag_size, max_indices, weight_grad, params, tid);
+  }
+}
+
+template <typename I>
+kernel void embedding_bag_backward_count(
+    device const I* indices [[buffer(0)]],
+    device atomic_uint* counts [[buffer(1)]],
+    constant EmbeddingBagBackwardParams<uint32_t>& params [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]) {
+  auto weight_idx = indices[tid];
+  if (weight_idx != params.padding_idx) {
+    atomic_fetch_add_explicit(counts + weight_idx, 1u, memory_order_relaxed);
   }
 }
 
@@ -467,7 +485,8 @@ kernel void embedding_bag_per_sample_weights_backward(
       device const I* max_indices [[buffer(4)]],                            \
       device const T* per_sample_weights [[buffer(5)]],                     \
       device AtomicType_t<T>* weight_grad [[buffer(6)]],                    \
-      constant EmbeddingBagBackwardParams<uint32_t>& params [[buffer(7)]],  \
+      device const uint* counts [[buffer(7)]],                              \
+      constant EmbeddingBagBackwardParams<uint32_t>& params [[buffer(8)]],  \
       uint tid [[thread_position_in_grid]]);                                \
                                                                             \
   template [[host_name("embedding_bag_per_sample_weights_backward_" #T      \
@@ -488,3 +507,14 @@ REGISTER_EMBEDDING_BAG_OP(half, int);
 REGISTER_EMBEDDING_BAG_OP(half, long);
 REGISTER_EMBEDDING_BAG_OP(bfloat, int);
 REGISTER_EMBEDDING_BAG_OP(bfloat, long);
+
+#define REGISTER_EMBEDDING_BAG_BACKWARD_COUNT(I)                           \
+  template [[host_name("embedding_bag_backward_count_" #I)]]               \
+  kernel void embedding_bag_backward_count<I>(                             \
+      device const I* indices [[buffer(0)]],                               \
+      device atomic_uint* counts [[buffer(1)]],                            \
+      constant EmbeddingBagBackwardParams<uint32_t>& params [[buffer(2)]], \
+      uint tid [[thread_position_in_grid]]);
+
+REGISTER_EMBEDDING_BAG_BACKWARD_COUNT(int);
+REGISTER_EMBEDDING_BAG_BACKWARD_COUNT(long);

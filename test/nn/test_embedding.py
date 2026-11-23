@@ -1001,7 +1001,6 @@ class TestEmbeddingNNDeviceType(NNTestCase):
         torch.testing.assert_close(torch.ones(dim, device=device), grad_at_r(dtype))
 
     # https://github.com/pytorch/pytorch/issues/190063
-    @expectedFailureMPS  # https://github.com/pytorch/pytorch/issues/190061
     @dtypes(torch.float32, torch.float64)
     def test_embedding_bag_scale_grad_by_freq_mixed_counts(self, device, dtype):
         # scale_grad_by_freq must divide each index's gradient by that index's

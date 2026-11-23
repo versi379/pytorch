@@ -37,6 +37,7 @@ struct EmbeddingBagBackwardParams {
   EmbeddingBagMode mode;
   int64_t padding_idx;
   bool use_per_sample_weights;
+  bool scale_grad_by_freq;
 };
 
 template <typename idx_type_t = uint32_t>

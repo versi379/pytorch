@@ -223,14 +223,27 @@ Tensor _embedding_bag_dense_backward_mps(const Tensor& output_grad,
   params.feature_size = output_grad.size(1);
   params.mode = static_cast<EmbeddingBagMode>(mode);
   params.padding_idx = padding_idx;
+  // Like CPU and CUDA, max mode ignores scale_grad_by_freq
+  params.scale_grad_by_freq = scale_grad_by_freq && params.mode != EmbeddingBagMode::MAX;
 
   auto num_indices = offset2bag.numel();
   auto num_threads = (params.mode == EmbeddingBagMode::MAX) ? output_grad.numel() : num_indices * params.feature_size;
+  Tensor counts;
+  if (params.scale_grad_by_freq) {
+    counts = at::zeros({num_weights}, indices.options().dtype(kUInt32));
+  }
   MPSStream* stream = getCurrentMPSStream();
 
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> computeEncoder = stream->commandEncoder();
+      if (params.scale_grad_by_freq) {
+        auto count_pso = lib.getPipelineStateForFunc(
+            fmt::format("embedding_bag_backward_count_{}", mps::scalarToMetalTypeString(indices)));
+        [computeEncoder setComputePipelineState:count_pso];
+        mps::mtl_setArgs(computeEncoder, indices, counts, params);
+        mps::mtl_dispatch1DJob(computeEncoder, count_pso, num_indices);
+      }
       auto pipeline_state = lib.getPipelineStateForFunc(fmt::format("embedding_bag_backward_{}_{}",
                                                                     mps::scalarToMetalTypeString(output_grad),
                                                                     mps::scalarToMetalTypeString(indices)));
@@ -246,6 +259,7 @@ Tensor _embedding_bag_dense_backward_mps(const Tensor& output_grad,
                        max_indices,
                        use_per_sample_weights ? per_sample_weights_opt : std::nullopt,
                        weight_grad,
+                       params.scale_grad_by_freq ? counts : weight_grad,
                        params);
 
       mps::mtl_dispatch1DJob(computeEncoder, pipeline_state, num_threads);
