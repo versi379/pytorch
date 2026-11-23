@@ -27,6 +27,68 @@ inline float load_affine_bias(device const void*, uint) {
   return 0;
 }
 
+// Merges the count, mean and sum of squared deviations (m2) of a set of
+// elements into the running statistics of another (Chan et al.). The rounding
+// errors of the running mean and m2 are kept in mean_err and m2_err, so that
+// small updates are not lost against large running values.
+inline void welford_merge(
+    thread float& n,
+    thread float& mean,
+    thread float& mean_err,
+    thread float& m2,
+    thread float& m2_err,
+    float n_b,
+    float mean_b,
+    float m2_b) {
+  float n_ab = n + n_b;
+  // The few-ulp error of fast::divide only scales this one update.
+  float w = ::metal::fast::divide(n_b, n_ab);
+  float delta = (mean_b - mean) - mean_err;
+  float mean_inc = delta * w;
+  float new_mean = mean + mean_inc;
+  mean_err -= (new_mean - mean) - mean_inc;
+  mean = new_mean;
+  float m2_inc = fma(delta * delta * n, w, m2_b);
+  float new_m2 = m2 + m2_inc;
+  m2_err -= (new_m2 - m2) - m2_inc;
+  m2 = new_m2;
+  n = n_ab;
+}
+
+// Merges the (n, mean, m2) of every thread in the threadgroup: each simdgroup
+// first, then the simdgroups. Returns (n, mean, m2) of the threadgroup.
+inline float3 threadgroup_welford(
+    threadgroup float3* data,
+    float n,
+    float mean,
+    float m2,
+    unsigned idx,
+    unsigned size) {
+  float n_s = ::metal::simd_sum(n);
+  float mean_s = ::metal::simd_sum(n * mean) / n_s;
+  float d = mean - mean_s;
+  float m2_s = ::metal::simd_sum(fma(n * d, d, m2));
+  if (idx % simdgroup_size == 0) {
+    data[idx / simdgroup_size] = float3(n_s, mean_s, m2_s);
+  }
+  if (size > simdgroup_size) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (idx < simdgroup_size) {
+      auto p = idx < (size + simdgroup_size - 1) / simdgroup_size ? data[idx]
+                                                                  : float3(0);
+      float n_g = ::metal::simd_sum(p.x);
+      float mean_g = ::metal::simd_sum(p.x * p.y) / n_g;
+      float d_g = p.y - mean_g;
+      float m2_g = ::metal::simd_sum(fma(p.x * d_g, d_g, p.z));
+      if (idx == 0) {
+        data[0] = float3(n_g, mean_g, m2_g);
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return data[0];
+}
+
 template <
     typename T,
     typename stat_T,
@@ -49,40 +111,57 @@ kernel void group_norm(
   device T* y = Y + group_offset;
 
   // Divide the elements of the group between each thread in the threadgroup.
-  // First, each thread reads all of the elements assigned to it and computes a
-  // partial sum and sum of squares of those elements.
-  float partial_sum = 0;
-  float partial_sum_sq = 0;
+  // First, each thread computes the count, mean and m2 of the elements
+  // assigned to it, one block at a time. Values are taken as offsets from the
+  // first element of the group, so a mean much larger than the spread keeps
+  // its precision. Unlike `sum(x**2) - sum(x)**2 / m`, the merges do not
+  // cancel, so an outlier in that first element does not cost the variance
+  // its precision either.
+  float shift = float(x[0]);
+  float n = 0, mean_v = 0, mean_err = 0, m2 = 0, m2_err = 0;
 
   for (idx_T r = 0; r < params.elements_per_group; r += tptg * BLOCK_SIZE) {
     auto base = r + tid * BLOCK_SIZE;
+    if (base + BLOCK_SIZE <= params.elements_per_group) {
+      float v[BLOCK_SIZE];
+      float block_sum = 0;
 #pragma unroll
-    for (idx_T i = 0; i < BLOCK_SIZE; i++) {
-      if (base + i < params.elements_per_group) {
-        auto v = static_cast<float>(x[base + i]);
-        partial_sum += v;
-        partial_sum_sq = fma(v, v, partial_sum_sq);
+      for (idx_T i = 0; i < BLOCK_SIZE; i++) {
+        v[i] = static_cast<float>(x[base + i]) - shift;
+        block_sum += v[i];
+      }
+      float block_mean = block_sum / BLOCK_SIZE;
+      float block_m2 = 0;
+#pragma unroll
+      for (idx_T i = 0; i < BLOCK_SIZE; i++) {
+        float d = v[i] - block_mean;
+        block_m2 = fma(d, d, block_m2);
+      }
+      welford_merge(
+          n, mean_v, mean_err, m2, m2_err, BLOCK_SIZE, block_mean, block_m2);
+    } else {
+      for (auto i = base; i < params.elements_per_group; i++) {
+        welford_merge(
+            n,
+            mean_v,
+            mean_err,
+            m2,
+            m2_err,
+            1,
+            static_cast<float>(x[i]) - shift,
+            0);
       }
     }
   }
 
-  // Second, sum all the partial sums of the threads in the threadgroup and
+  // Second, merge the statistics of all the threads in the threadgroup and
   // calculate the mean and rstd.
-  threadgroup float local_sums[simdgroup_size];
-  threadgroup float local_sums_sq[simdgroup_size];
+  threadgroup float3 local_stats[simdgroup_size];
+  auto stats = threadgroup_welford(
+      local_stats, n, mean_v + mean_err, m2 + m2_err, tid, tptg);
 
-  auto reduction_result = threadgroup_sum2(
-      local_sums, local_sums_sq, partial_sum, partial_sum_sq, tid, tptg);
-
-  float sum_val = reduction_result[0];
-  float sum_sq_val = reduction_result[1];
-  float m = float(params.elements_per_group);
-  float mean_val = sum_val / m;
-  // Variance of an array `a` is `sum((a - mean(a))**2) / m`, which we
-  // factor out into `sum(a**2) / m - 2 * mean(a) * sum(a) / m + mean(a)**2`
-  // so that both the mean and variance can be calculated in one pass.
-  float var_val =
-      (sum_sq_val - 2 * mean_val * sum_val) / m + mean_val * mean_val;
+  float mean_val = shift + stats.y;
+  float var_val = stats.z / float(params.elements_per_group);
   float rstd_val = metal::precise::rsqrt(var_val + params.eps);
 
   // Third, each thread reads its assigned input elements again, applies the

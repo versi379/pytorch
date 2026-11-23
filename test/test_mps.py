@@ -15381,6 +15381,26 @@ class TestConsistency(TestCaseMPS):
             self.assertEqual(x.grad.cpu(), x_cpu.grad)
             self.assertEqual(gamma.grad.cpu(), gamma_cpu.grad)
 
+    def test_group_norm_large_mean(self, device):
+        # https://github.com/pytorch/pytorch/issues/186866
+        # A mean much larger than the spread must not cancel the variance, and an
+        # outlier in the first element of a group must not cost it its precision.
+        # The first group of the first case is constant, like the one
+        # test_group_norm_backward_large_input builds.
+        large_mean = 1000 + 0.01 * torch.randn(2, 4, 4098)
+        large_mean[0, :2] = 1000
+        outlier = torch.randn(1, 32, 2**20)
+        outlier[0, 0, 0] = 1e4
+        outliers = torch.randn(2, 320, 64, 64)
+        outliers[:, ::10, 0, 0] = 1e3
+        for x, G in ((large_mean, 2), (outlier, 1), (outliers, 32)):
+            N, C = x.shape[:2]
+            HxW = x[0, 0].numel()
+            y, _, rstd = torch.native_group_norm(x.to(device), None, None, N, C, HxW, G, 1e-5)
+            y_ref, _, rstd_ref = torch.native_group_norm(x.double(), None, None, N, C, HxW, G, 1e-5)
+            self.assertEqual(rstd.cpu(), rstd_ref, exact_dtype=False, rtol=1e-5, atol=0)
+            self.assertEqual(y.cpu(), y_ref, exact_dtype=False, rtol=0, atol=1e-2)
+
     # Test large tensor inputs to `group_norm`. This test currently passes
     # because 64-bit indexing is supported. But if 64-bit is turned off, the
     # test fails.
