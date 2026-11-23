@@ -173,8 +173,12 @@ void embedding_bag_impl(
   const bool is_last_bag = bag_idx + 1 == num_bags;
   uint32_t indices_start =
       (bag_idx == 0) ? 0u : static_cast<uint32_t>(offsets[bag_idx]);
-  uint32_t indices_end =
-      is_last_bag ? num_indices : static_cast<uint32_t>(offsets[offsets_end]);
+  // With include_last_offset, offsets has num_bags + 1 entries and the last one
+  // ends the last bag
+  uint32_t indices_end = !is_last_bag
+      ? static_cast<uint32_t>(offsets[offsets_end])
+      : (params.include_last_offset ? static_cast<uint32_t>(offsets[num_bags])
+                                    : num_indices);
 
   if (indices_end > num_indices || indices_end < indices_start) {
     TORCH_REPORT_ERROR(
@@ -188,6 +192,15 @@ void embedding_bag_impl(
         ") but num_indices is ",
         num_indices);
     return;
+  }
+
+  // With include_last_offset, indices past offsets[num_bags] are in no bag.
+  // Mark them -1 so the backward kernels skip them
+  if (is_last_bag) {
+    for (auto i = indices_end + feature_idx; i < num_indices;
+         i += feature_size) {
+      offset2bag[i] = -1;
+    }
   }
 
   auto out_val = ReductionOpInit<M, T>()();
@@ -304,6 +317,10 @@ void embedding_bag_backward_sum_mean_impl(
     uint tid) {
   auto feature_size = params.feature_size;
   auto indices_idx = tid / feature_size;
+  // -1 marks indices in no bag, past offsets[num_bags] with include_last_offset
+  if (offset2bag[indices_idx] < 0) {
+    return;
+  }
   auto bag_idx = static_cast<uint32_t>(offset2bag[indices_idx]);
   auto bag_size_val = bag_size[bag_idx];
   auto weight_idx = indices[indices_idx];
@@ -420,7 +437,7 @@ kernel void embedding_bag_per_sample_weights_backward(
   auto indices_idx = tid / feature_size;
   auto weight_idx = indices[indices_idx];
 
-  if (weight_idx != padding_idx) {
+  if (weight_idx != padding_idx && offset2bag[indices_idx] >= 0) {
     auto feature_idx = tid % feature_size;
     auto bag_idx = static_cast<uint32_t>(offset2bag[indices_idx]);
     constant auto& output_grad_strides = params.output_grad_strides;

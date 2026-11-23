@@ -3,7 +3,7 @@ import itertools
 import random
 import subprocess
 import sys
-from functools import wraps
+from functools import partial, wraps
 from itertools import product
 
 import torch
@@ -13,6 +13,8 @@ from torch.testing._internal.common_device_type import (
     dtypes,
     dtypesIfCUDA,
     dtypesIfXPU,
+    expectedFailureCPU,
+    expectedFailureCUDA,
     expectedFailureMPS,
     expectedFailureXLA,
     instantiate_device_type_tests,
@@ -1022,6 +1024,33 @@ class TestEmbeddingNNDeviceType(NNTestCase):
             expected[1] = row1  # index 1: 2 occurrences, count 2
             expected[3] = row3  # index 3: 1 occurrence, count 1
             self.assertEqual(weight.grad, expected)
+
+    # https://github.com/pytorch/pytorch/issues/190060
+    @expectedFailureCPU  # mean and max still count indices past offsets[-1], #52851
+    @expectedFailureCUDA  # the last bag ends at len(indices), #29019
+    @skipXPUIf(True, "include_last_offset last-bag end not checked on XPU")
+    @dtypes(torch.float32)
+    def test_embedding_bag_include_last_offset_trailing_indices(self, device, dtype):
+        # offsets[-1] ends the last bag, so indices after it are in no bag and
+        # everything must match the same call with them dropped
+        weight = torch.arange(18, device=device, dtype=dtype).reshape(6, 3)
+        idx = torch.tensor([4, 0, 2, 2, 5, 1], device=device)
+        off = torch.tensor([0, 1, 4], device=device)
+        psw = torch.tensor([0.5, 2.0, 1.5, -1.0, 3.0, 0.25], device=device, dtype=dtype)
+        for mode in ("sum", "mean", "max"):
+            bag = partial(F.embedding_bag, mode=mode)
+            w, w_ref = weight.clone().requires_grad_(), weight.clone().requires_grad_()
+            p = psw.clone().requires_grad_() if mode == "sum" else None
+            p_ref = psw[:4].clone().requires_grad_() if mode == "sum" else None
+            out = bag(idx, w, off, per_sample_weights=p, include_last_offset=True)
+            ref = bag(idx[:4], w_ref, off[:-1], per_sample_weights=p_ref)
+            self.assertEqual(out, ref, msg=mode)
+            grad = torch.arange(1, out.numel() + 1).to(out).view_as(out)
+            out.backward(grad)
+            ref.backward(grad)
+            self.assertEqual(w.grad, w_ref.grad, msg=mode)
+            if p is not None:
+                self.assertEqual(p.grad, F.pad(p_ref.grad, (0, 2)), msg=mode)
 
     # Check correctness of torch.nn.functional.embedding_bag forward and
     # backward functions with padding_idx, given a 2D indices input. Compare

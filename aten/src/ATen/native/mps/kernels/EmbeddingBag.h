@@ -25,6 +25,7 @@ struct EmbeddingBagParams {
   int64_t padding_idx;
 
   bool use_per_sample_weights;
+  bool include_last_offset;
 };
 
 template <typename idx_type_t = uint32_t>

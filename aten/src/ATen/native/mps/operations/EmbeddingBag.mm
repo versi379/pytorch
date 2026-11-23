@@ -20,6 +20,7 @@
 #include <ATen/ops/_embedding_bag_native.h>
 #include <ATen/ops/_embedding_bag_per_sample_weights_backward_native.h>
 #include <ATen/ops/empty.h>
+#include <ATen/ops/full.h>
 #endif
 
 namespace at::native {
@@ -76,7 +77,10 @@ static std::tuple<Tensor, Tensor, Tensor, Tensor> _embedding_bag_mps_impl(
   int64_t feature_size = weight.size(1);
 
   auto bag_size = at::empty({num_bags}, indices.options());
-  auto offset2bag = at::empty({indices.size(0)}, indices.options());
+  // Without bags (a single offset with include_last_offset) no forward thread
+  // runs, so mark every index as in no bag for the backward kernels
+  auto offset2bag =
+      num_bags == 0 ? at::full({num_indices}, -1, indices.options()) : at::empty({num_indices}, indices.options());
   auto output = at::empty({num_bags, feature_size}, weight.options());
 
   Tensor max_indices;
@@ -108,6 +112,7 @@ static std::tuple<Tensor, Tensor, Tensor, Tensor> _embedding_bag_mps_impl(
   params.mode = static_cast<EmbeddingBagMode>(mode);
   params.padding_idx = padding_idx;
   params.num_weights = weight.size(0);
+  params.include_last_offset = include_last_offset;
 
   auto num_threads = output.numel();
   MPSStream* stream = getCurrentMPSStream();
