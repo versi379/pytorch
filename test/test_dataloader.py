@@ -2983,6 +2983,21 @@ except RuntimeError as e:
             dataloader = DataLoader(self.dataset, batch_size=2, num_workers=1000)
 
 
+class TestSamplerDevice(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
+    # https://github.com/pytorch/pytorch/issues/110820
+    @parametrize("replacement", [False, True])
+    def test_random_sampler_device(self, device, replacement):
+        from torch.utils.data import RandomSampler
+
+        with torch.device(device):
+            self.assertEqual(len(list(RandomSampler(range(10), replacement))), 10)
+        generator = torch.Generator(device=device)
+        sampler = RandomSampler(range(10), replacement, generator=generator)
+        self.assertEqual(len(list(sampler)), 10)
+
+
 class TestDataLoaderDevice(TestCase):
     hw_classification = HardwareClassification.ACCELERATOR
 
@@ -4061,6 +4076,9 @@ class TestOutOfOrderDataLoader(TestCase):
         self.assertEqual(expected_data, data)
 
 
+instantiate_device_type_tests(
+    TestSamplerDevice, globals(), allow_mps=True, allow_xpu=True
+)
 instantiate_device_type_tests(TestDataLoaderDevice, globals(), allow_xpu=True)
 instantiate_parametrized_tests(TestDataLoaderMultiProcessing)
 instantiate_device_type_tests(

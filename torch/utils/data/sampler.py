@@ -165,22 +165,31 @@ class RandomSampler(Sampler[int]):
             generator.manual_seed(seed)
         else:
             generator = self.generator
+        # Draw on the generator's device, not the default device
+        device = generator.device
 
         if self.replacement:
             for _ in range(self.num_samples // 32):
                 yield from torch.randint(
-                    high=n, size=(32,), dtype=torch.int64, generator=generator
+                    high=n,
+                    size=(32,),
+                    dtype=torch.int64,
+                    generator=generator,
+                    device=device,
                 ).tolist()
             yield from torch.randint(
                 high=n,
                 size=(self.num_samples % 32,),
                 dtype=torch.int64,
                 generator=generator,
+                device=device,
             ).tolist()
         else:
             for _ in range(self.num_samples // n):
-                yield from torch.randperm(n, generator=generator).tolist()
-            yield from torch.randperm(n, generator=generator).tolist()[
+                yield from torch.randperm(
+                    n, generator=generator, device=device
+                ).tolist()
+            yield from torch.randperm(n, generator=generator, device=device).tolist()[
                 : self.num_samples % n
             ]
 
