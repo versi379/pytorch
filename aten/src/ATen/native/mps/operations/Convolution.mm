@@ -890,9 +890,12 @@ static Tensor _mps_convolution_impl(const Tensor& input_t,
   TensorArg output{output_t, "result", 0};
 
   if (!is_macos_at_least(MacOSVersion::MACOS_15_1) && !is3DConv && !is1DConv) {
-    // On macOS < 15.1, MPS convolution kernel does not support output channels > 2^16
+    // On macOS < 15.1, MPS convolution gives wrong results when any output dimension exceeds 2^16, not only C_out
     for (auto elem : output_t.sizes()) {
-      TORCH_CHECK_NOT_IMPLEMENTED(elem <= (1 << 16), "Output channels > 65536 not supported at the MPS device. ");
+      TORCH_CHECK_NOT_IMPLEMENTED(
+          elem <= (1 << 16),
+          "MPS convolution with an output dimension larger than 65536 requires macOS 15.1 or newer, got output size ",
+          output_t.sizes());
     }
   }
 
@@ -1058,9 +1061,12 @@ static Tensor mps_convolution_backward_input(IntArrayRef input_size,
   using namespace mps;
   bool is3DConv = grad_output_t.dim() == 5;
   if (!is_macos_at_least(MacOSVersion::MACOS_15_1)) {
-    // On macOS < 15.1, MPS convolution kernel does not support output channels > 2^16
+    // On macOS < 15.1, MPS convolution gives wrong results when any output dimension exceeds 2^16, not only C_out
     for (auto elem : grad_output_t.sizes()) {
-      TORCH_CHECK_NOT_IMPLEMENTED(elem <= (1 << 16), "Output channels > 65536 not supported at the MPS device. ");
+      TORCH_CHECK_NOT_IMPLEMENTED(
+          elem <= (1 << 16),
+          "MPS convolution with an output dimension larger than 65536 requires macOS 15.1 or newer, got output size ",
+          grad_output_t.sizes());
     }
   }
 
