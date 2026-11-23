@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <numeric>
 
 namespace at::native {
 
@@ -204,6 +205,49 @@ static Tensor conv3d_weights_to_dhwio(const Tensor& weight) {
   return output;
 }
 
+// Weight of a transposed conv3d (C_in, C_out / groups, kD, kH, kW) as the
+// phase-grouped DHWIO rows conv_transpose3d_simd reads.
+static Tensor conv_transpose3d_weights_packed(const Tensor& weight,
+                                              IntArrayRef stride,
+                                              IntArrayRef dilation,
+                                              int64_t groups) {
+  using namespace mps;
+  const auto output_channels_per_group = weight.size(1);
+  const auto output_channels = output_channels_per_group * groups;
+  const auto input_channels_per_group = weight.size(0) / groups;
+  const auto kernel_depth = weight.size(2);
+  const auto kernel_height = weight.size(3);
+  auto output = at::empty({kernel_depth * kernel_height * weight.size(4) * input_channels_per_group, output_channels},
+                          weight.options());
+  ConvTransposeWeightPackParams params{
+      .output_channels = static_cast<int32_t>(output_channels),
+      .output_channels_per_group = static_cast<int32_t>(output_channels_per_group),
+      .input_channels_per_group = static_cast<int32_t>(input_channels_per_group),
+  };
+  for (const auto i : c10::irange(3)) {
+    params.kernel_size[i] = static_cast<int32_t>(weight.size(i + 2));
+    params.tap_step[i] = static_cast<int32_t>(stride[i] / std::gcd(stride[i], dilation[i]));
+  }
+  for (const auto i : c10::irange(5)) {
+    params.strides[i] = static_cast<int32_t>(weight.stride(i));
+  }
+  auto pipeline =
+      lib.getPipelineStateForFunc(fmt::format("conv_transpose_weight_pack_{}", scalarToMetalTypeString(weight)));
+  auto stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      auto encoder = stream->commandEncoder();
+      getMPSProfiler().beginProfileKernel(pipeline, "conv_transpose_weight_pack", {weight}, stream);
+      [encoder setComputePipelineState:pipeline];
+      mtl_setArgs(encoder, weight, output, params);
+      [encoder dispatchThreads:MTLSizeMake(output_channels, input_channels_per_group, kernel_depth * kernel_height)
+          threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(output_channels, 256), 1, 1)];
+      getMPSProfiler().endProfileKernel(pipeline, stream);
+    }
+  });
+  return output;
+}
+
 struct Conv3dMppSpecialization {
   std::string dtype;
   int kernel_depth, kernel_height, kernel_width;
@@ -251,10 +295,16 @@ static id<MTLComputePipelineState> conv3d_mpp_pipeline(const Conv3dMppSpecializa
 
 MTLComputePipelineState_t mps::Conv3dSimdTile::pipeline_state(mps::MetalShaderLibrary& library,
                                                               const std::string& dtype,
-                                                              bool use_long_index) const {
-  const char* prefix = use_long_index ? "conv3d_simd_long" : "conv3d_simd";
-  const auto name =
-      fmt::format("{}_{}_{}_{}_{}_{}", prefix, dtype, block_rows, block_columns, simdgroups_rows, simdgroups_columns);
+                                                              bool use_long_index,
+                                                              bool transposed) const {
+  const auto name = fmt::format("{}{}_{}_{}_{}_{}_{}",
+                                transposed ? "conv_transpose3d_simd" : "conv3d_simd",
+                                use_long_index ? "_long" : "",
+                                dtype,
+                                block_rows,
+                                block_columns,
+                                simdgroups_rows,
+                                simdgroups_columns);
   return library.getPipelineStateForFunc(name);
 }
 
@@ -283,6 +333,7 @@ static void conv3d_metal_launch(id<MTLComputePipelineState> pipeline,
 
 // conv3d forward on the Metal kernels: MPP on macOS 26.2+, simdgroup otherwise;
 // planes past int32 take the long-indexed simdgroup variant on any macOS.
+// `transposed` computes conv_transpose3d instead, always on the simdgroup kernel.
 static void conv3d_metal_forward(const Tensor& input_t,
                                  const Tensor& weight_t,
                                  const std::optional<Tensor>& bias_opt,
@@ -290,7 +341,8 @@ static void conv3d_metal_forward(const Tensor& input_t,
                                  IntArrayRef stride,
                                  IntArrayRef dilation,
                                  int64_t groups,
-                                 const Tensor& output_t) {
+                                 const Tensor& output_t,
+                                 bool transposed = false) {
   using namespace mps;
   const auto dtype = input_t.scalar_type();
   const bool bias_defined = bias_opt && bias_opt->defined();
@@ -321,10 +373,11 @@ static void conv3d_metal_forward(const Tensor& input_t,
   const int64_t input_channels_per_group = input_channels / groups;
   TORCH_CHECK(std::in_range<int32_t>(weight_t.size(2) * weight_t.size(3) * weight_t.size(4) * input_channels_per_group),
               "conv3d: kernel volume times channels per group exceeds int32");
-  const bool use_mpp = !use_long_index && has_mpp();
+  const bool use_mpp = !transposed && !use_long_index && has_mpp();
 
   const auto activation = conv3d_to_ndhwc(input_t); // NDHWC
-  const auto weights = conv3d_weights_to_dhwio(weight_t); // DHWIO
+  const auto weights = transposed ? conv_transpose3d_weights_packed(weight_t, stride, dilation, groups)
+                                  : conv3d_weights_to_dhwio(weight_t); // DHWIO
   std::optional<Tensor> bias;
   if (bias_defined) {
     bias = bias_opt->scalar_type() == dtype ? bias_opt->contiguous() : bias_opt->to(dtype).contiguous();
@@ -395,18 +448,28 @@ static void conv3d_metal_forward(const Tensor& input_t,
     }
   }
 
-  const auto tile = select_conv3d_simd_tile(output_height, output_width, use_long_index);
-  const auto pipeline = tile.pipeline_state(lib, dtype_name, use_long_index);
+  // A transposed threadgroup computes one (height, width) phase of an output plane.
+  const int64_t phases = transposed ? stride[1] * stride[2] : 1;
+  const auto phase_height = c10::metal::ceil_div(output_height, transposed ? stride[1] : int64_t(1));
+  const auto phase_width = c10::metal::ceil_div(output_width, transposed ? stride[2] : int64_t(1));
+  const auto tile = select_conv3d_simd_tile(phase_height, phase_width, use_long_index);
+  const auto pipeline = tile.pipeline_state(lib, dtype_name, use_long_index, transposed);
   const auto output_channel_tiles = c10::metal::ceil_div(int64_t(conv2d.C_out_per_group), int64_t(tile.block_columns));
-  const auto output_position_tiles =
-      c10::metal::ceil_div(int64_t(conv2d.outH) * conv2d.outW, static_cast<int64_t>(tile.block_rows));
+  const auto output_position_tiles = c10::metal::ceil_div(phase_height * phase_width, int64_t(tile.block_rows));
   const auto threadgroups = MTLSizeMake(static_cast<NSUInteger>(output_channel_tiles * groups),
                                         static_cast<NSUInteger>(output_position_tiles),
-                                        static_cast<NSUInteger>(conv2d.N) * params.outD);
+                                        static_cast<NSUInteger>(conv2d.N) * params.outD * phases);
   const auto threads_per_threadgroup =
       MTLSizeMake(static_cast<NSUInteger>(tile.simdgroups_rows) * tile.simdgroups_columns * 32, 1, 1);
-  conv3d_metal_launch(
-      pipeline, "conv3d_simd", activation, weights, bias, output_t, params, threadgroups, threads_per_threadgroup);
+  conv3d_metal_launch(pipeline,
+                      transposed ? "conv_transpose3d_simd" : "conv3d_simd",
+                      activation,
+                      weights,
+                      bias,
+                      output_t,
+                      params,
+                      threadgroups,
+                      threads_per_threadgroup);
 }
 
 // A 1x1x1 stride-1 no-pad conv is a per-voxel GEMM over channels; both the
@@ -1475,6 +1538,45 @@ static Tensor mps_convolution_transpose_forward(const Tensor& grad_output,
       input_size, grad_output, weight, padding, stride, dilation, groups, false, output_memory_format);
 }
 
+static Tensor conv_transpose3d_metal(const Tensor& input_t,
+                                     const Tensor& weight_t,
+                                     IntArrayRef padding,
+                                     IntArrayRef output_padding,
+                                     IntArrayRef stride,
+                                     IntArrayRef dilation,
+                                     int64_t groups) {
+  TORCH_CHECK(isFloatingType(input_t.scalar_type()), "Convolution is supported only for Floating types");
+  CheckedFrom c = "conv_transpose3d_metal";
+  TensorArg input{input_t, "input", 1}, weight{weight_t, "weight", 2};
+  checkAllSameType(c, {input, weight});
+  checkAllSameGPU(c, {input, weight});
+  auto output_t =
+      at::empty(conv_input_size(input_t.sizes(), weight_t.sizes(), padding, output_padding, stride, dilation, groups),
+                input_t.options(),
+                conv_backward_memory_format(input_t, weight_t));
+  TensorArg output{output_t, "result", 0};
+  convolution_shape_check(c, output, weight, input, padding, stride, dilation, groups);
+  if (output_t.numel() == 0) {
+    return output_t;
+  }
+  // At stride 1 this is a conv with the flipped, in/out-swapped weight, which the conv3d paths run faster.
+  std::array<int64_t, 3> conv_padding;
+  bool is_flipped_conv = true;
+  for (const auto i : c10::irange(3)) {
+    conv_padding[i] = dilation[i] * (weight_t.size(i + 2) - 1) - padding[i];
+    is_flipped_conv &= stride[i] == 1 && output_padding[i] == 0 && conv_padding[i] >= 0;
+  }
+  if (is_flipped_conv) {
+    const auto conv_weight =
+        weight_t.unflatten(0, {groups, weight_t.size(0) / groups}).transpose(1, 2).flatten(0, 1).flip({2, 3, 4});
+    return _mps_convolution_impl(
+        input_t, conv_weight, std::nullopt, conv_padding, stride, dilation, groups, std::nullopt, output_t);
+  }
+  conv3d_metal_forward(
+      input_t, weight_t, std::nullopt, padding, stride, dilation, groups, output_t, /*transposed=*/true);
+  return output_t;
+}
+
 Tensor _mps_convolution_transpose(const Tensor& input_t,
                                   const Tensor& weight_t,
                                   IntArrayRef padding,
@@ -1482,13 +1584,10 @@ Tensor _mps_convolution_transpose(const Tensor& input_t,
                                   IntArrayRef stride,
                                   IntArrayRef dilation,
                                   int64_t groups) {
-  bool is_unsupported_3d_dtype =
-      (input_t.dim() == 5 && (input_t.scalar_type() == kHalf || input_t.scalar_type() == kBFloat16));
-  TORCH_CHECK(!is_unsupported_3d_dtype, "ConvTranspose 3D with BF16 or FP16 types is not supported on MPS");
-
-  auto output_t =
-      mps_convolution_transpose_forward(input_t, weight_t, padding, output_padding, stride, dilation, groups);
-  return output_t;
+  if (input_t.dim() == 5) {
+    return conv_transpose3d_metal(input_t, weight_t, padding, output_padding, stride, dilation, groups);
+  }
+  return mps_convolution_transpose_forward(input_t, weight_t, padding, output_padding, stride, dilation, groups);
 }
 
 static Tensor mps_convolution_transpose_backward_input(const Tensor& grad_output_t,

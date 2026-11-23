@@ -27,7 +27,8 @@ struct Conv3dSimdTile {
   MTLComputePipelineState_t pipeline_state(
       MetalShaderLibrary& library,
       const std::string& dtype,
-      bool use_long_index) const;
+      bool use_long_index,
+      bool transposed) const;
 };
 
 Conv3dMppTile select_conv3d_mpp_tile(

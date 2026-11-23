@@ -74,10 +74,71 @@ kernel void nchw_to_nhwc(
   }
 }
 
+// (count, first row) of the taps that start at `first` in the packed weight of
+// a transposed conv, which stores a dimension's taps grouped by first tap.
+inline int2 transposed_tap_block(int first, int kernel_size, int tap_step) {
+  return int2(
+      (kernel_size - first + tap_step - 1) / tap_step,
+      first * (kernel_size / tap_step) + min(first, kernel_size % tap_step));
+}
+
+inline int transposed_tap_step(int stride, int dilation) {
+  int a = stride, b = dilation;
+  while (b != 0) {
+    const int r = a % b;
+    a = b;
+    b = r;
+  }
+  return stride / a;
+}
+
+struct TransposedTaps {
+  int count;
+  int input_offset;
+  int input_step;
+  int packed_offset;
+};
+
+// Along one dimension of a transposed conv, output q * stride + phase reads
+// input (q * stride + phase + padding - k * dilation) / stride for every tap k
+// where that divides. Those taps are first, first + tap_step, ..., and the
+// j-th reads input q + input_offset + j * input_step.
+inline TransposedTaps transposed_taps(
+    int phase,
+    int kernel_size,
+    int stride,
+    int padding,
+    int dilation) {
+  const int tap_step = transposed_tap_step(stride, dilation);
+  TransposedTaps taps = {0, 0, 0, 0};
+  for (int first = 0; first < min(tap_step, kernel_size); ++first) {
+    const int offset = phase + padding - first * dilation;
+    if (offset % stride == 0) {
+      const int2 block = transposed_tap_block(first, kernel_size, tap_step);
+      taps.count = block.x;
+      taps.input_offset = offset / stride;
+      taps.input_step = -dilation * tap_step / stride;
+      taps.packed_offset = block.y;
+      break;
+    }
+  }
+  return taps;
+}
+
 // Implicit-GEMM conv3d on simdgroup_matrix per (batch, out-depth) plane; k
 // walks DHWIO order, geometry is runtime state, fp32 accumulation. IDX = long
-// widens the flat spatial index when a plane exceeds int32.
-template <typename T, typename IDX, int BM, int BN, int BK, int WM, int WN>
+// widens the flat spatial index when a plane exceeds int32. TRANSPOSED computes
+// a transposed conv one output phase (position mod stride) per threadgroup, so
+// k walks only the taps that reach it, from conv_transpose_weight_pack.
+template <
+    typename T,
+    typename IDX,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool TRANSPOSED>
 kernel void conv3d_simd(
     device T* act [[buffer(0)]],
     device T* wts [[buffer(1)]],
@@ -103,13 +164,48 @@ kernel void conv3d_simd(
   const int g = int(tgid.x) / n_tiles;
   const int n_block = (int(tgid.x) % n_tiles) * BN;
   const IDX m_block = IDX(tgid.y) * BM;
-  const int dd = int(tgid.z) % gP.outD;
-  const int nb = int(tgid.z) / gP.outD;
   const int c0 = g * p.C_in_per_group;
   const int o0 = g * p.C_out_per_group;
 
-  const IDX M = IDX(p.outH) * p.outW;
-  const int K = gP.kD * p.kH * p.kW * p.C_in_per_group;
+  // Row m reads input (m / row_width, m % row_width) * in_step plus the tap
+  // offsets and writes output (m / row_width, m % row_width) * out_step +
+  // out_offset.
+  int plane = int(tgid.z);
+  int2 in_step = int2(p.sH, p.sW), out_step = int2(1, 1);
+  int2 out_offset = int2(0, 0);
+  int row_width = p.outW;
+  IDX M = IDX(p.outH) * p.outW;
+  if IF_CONSTEXPR (TRANSPOSED) {
+    const int phase = plane % (p.sH * p.sW);
+    plane /= p.sH * p.sW;
+    in_step = int2(1, 1);
+    out_step = int2(p.sH, p.sW);
+    out_offset = int2(phase / p.sW, phase % p.sW);
+    row_width = (p.outW + p.sW - 1) / p.sW;
+    M = IDX((p.outH + p.sH - 1) / p.sH) * row_width;
+  }
+  const int dd = plane % gP.outD;
+  const int nb = plane / gP.outD;
+  int3 taps = int3(gP.kD, p.kH, p.kW);
+  int3 tap_origin = int3(dd * gP.sD - gP.padD, -p.padH, -p.padW);
+  int3 tap_step = int3(gP.dD, p.dH, p.dW);
+  int64_t wts_row = 0;
+  if IF_CONSTEXPR (TRANSPOSED) {
+    const auto td = transposed_taps(dd % gP.sD, gP.kD, gP.sD, gP.padD, gP.dD);
+    const auto th = transposed_taps(out_offset.x, p.kH, p.sH, p.padH, p.dH);
+    const auto tw = transposed_taps(out_offset.y, p.kW, p.sW, p.padW, p.dW);
+    taps = int3(td.count, th.count, tw.count);
+    tap_origin =
+        int3(dd / gP.sD + td.input_offset, th.input_offset, tw.input_offset);
+    tap_step = int3(td.input_step, th.input_step, tw.input_step);
+    wts_row = int64_t(
+                  td.packed_offset * p.kH * p.kW +
+                  td.count *
+                      (th.packed_offset * p.kW + th.count * tw.packed_offset)) *
+        p.C_in_per_group;
+  }
+
+  const int K = taps.x * taps.y * taps.z * p.C_in_per_group;
   const int64_t act_nb = (int64_t)nb * gP.D * p.H * p.W * p.C_in;
 
   simdgroup_matrix<float, 8, 8> Cfrag[TM][TN];
@@ -136,21 +232,21 @@ kernel void conv3d_simd(
     if (k_ok) {
       cc = k % p.C_in_per_group;
       int r = k / p.C_in_per_group;
-      const int kw = r % p.kW;
-      r /= p.kW;
-      const int kh = r % p.kH;
-      const int kd = r / p.kH;
-      di = dd * gP.sD - gP.padD + kd * gP.dD;
-      dh = kh * p.dH - p.padH;
-      dw = kw * p.dW - p.padW;
+      const int kw = r % taps.z;
+      r /= taps.z;
+      const int kh = r % taps.y;
+      const int kd = r / taps.y;
+      di = tap_origin.x + kd * tap_step.x;
+      dh = tap_origin.y + kh * tap_step.y;
+      dw = tap_origin.z + kw * tap_step.z;
       k_ok = di >= 0 && di < gP.D;
     }
     for (int rl = a_r0; rl < BM; rl += TGP / BK) {
       const IDX m = m_block + rl;
       T v = T(0);
       if (k_ok && m < M) {
-        const int hi = int(m / p.outW) * p.sH + dh;
-        const int wi = int(m % p.outW) * p.sW + dw;
+        const int hi = int(m / row_width) * in_step.x + dh;
+        const int wi = int(m % row_width) * in_step.y + dw;
         if (hi >= 0 && hi < p.H && wi >= 0 && wi < p.W) {
           v =
               act[act_nb + (((int64_t)di * p.H + hi) * p.W + wi) * p.C_in + c0 +
@@ -163,7 +259,7 @@ kernel void conv3d_simd(
       const int kb = k0 + rl;
       const int n = n_block + b_n;
       Bs[rl * LDB + b_n] = (kb < K && n < p.C_out_per_group)
-          ? wts[(int64_t)kb * p.C_out + o0 + n]
+          ? wts[(wts_row + kb) * p.C_out + o0 + n]
           : T(0);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -198,7 +294,11 @@ kernel void conv3d_simd(
       if (m >= M) {
         continue;
       }
-      const int ho = int(m / p.outW), wo = int(m % p.outW);
+      const int ho = int(m / row_width) * out_step.x + out_offset.x;
+      const int wo = int(m % row_width) * out_step.y + out_offset.y;
+      if (TRANSPOSED && (ho >= p.outH || wo >= p.outW)) {
+        continue;
+      }
       for (int e = 0; e < 2; ++e) {
         const int n = n_block + warp_n + j * 8 + fn + e;
         if (n >= p.C_out_per_group) {
@@ -225,10 +325,10 @@ kernel void conv3d_simd(
   }
 }
 
-#define INSTANTIATE_CONV3D_SIMD(PFX, DT, IDX, BM, BN, BK, WM, WN)            \
+#define INSTANTIATE_CONV3D_SIMD(PFX, DT, IDX, BM, BN, BK, WM, WN, TR)        \
   template                                                                   \
       [[host_name(PFX "_" #DT "_" #BM "_" #BN "_" #WM "_" #WN)]] kernel void \
-      conv3d_simd<DT, IDX, BM, BN, BK, WM, WN>(                              \
+      conv3d_simd<DT, IDX, BM, BN, BK, WM, WN, TR>(                          \
           device DT*,                                                        \
           device DT*,                                                        \
           device DT*,                                                        \
@@ -239,14 +339,17 @@ kernel void conv3d_simd(
           uint);
 
 // int covers planes within int32; one long variant handles the rest
-#define INSTANTIATE_CONV3D_SIMD_ALL(DT)                             \
-  INSTANTIATE_CONV3D_SIMD("conv3d_simd", DT, int, 64, 64, 16, 2, 2) \
-  INSTANTIATE_CONV3D_SIMD("conv3d_simd", DT, int, 32, 64, 16, 1, 2) \
-  INSTANTIATE_CONV3D_SIMD("conv3d_simd_long", DT, long, 64, 64, 16, 2, 2)
+#define INSTANTIATE_CONV3D_SIMD_ALL(PFX, DT, TR)              \
+  INSTANTIATE_CONV3D_SIMD(PFX, DT, int, 64, 64, 16, 2, 2, TR) \
+  INSTANTIATE_CONV3D_SIMD(PFX, DT, int, 32, 64, 16, 1, 2, TR) \
+  INSTANTIATE_CONV3D_SIMD(PFX "_long", DT, long, 64, 64, 16, 2, 2, TR)
 
-INSTANTIATE_CONV3D_SIMD_ALL(float)
-INSTANTIATE_CONV3D_SIMD_ALL(half)
-INSTANTIATE_CONV3D_SIMD_ALL(bfloat)
+INSTANTIATE_CONV3D_SIMD_ALL("conv3d_simd", float, false)
+INSTANTIATE_CONV3D_SIMD_ALL("conv3d_simd", half, false)
+INSTANTIATE_CONV3D_SIMD_ALL("conv3d_simd", bfloat, false)
+INSTANTIATE_CONV3D_SIMD_ALL("conv_transpose3d_simd", float, true)
+INSTANTIATE_CONV3D_SIMD_ALL("conv_transpose3d_simd", half, true)
+INSTANTIATE_CONV3D_SIMD_ALL("conv_transpose3d_simd", bfloat, true)
 
 #define INSTANTIATE_NCHW_TO_NHWC(DT, TC, TX, VECR, VECW)             \
   template [[host_name("nchw_to_nhwc_" #DT "_" #TC "_" #TX "_" #VECR \
@@ -309,6 +412,55 @@ kernel void conv_weight_to_dhwio(
 INSTANTIATE_CONV_WEIGHT_TO_DHWIO(float)
 INSTANTIATE_CONV_WEIGHT_TO_DHWIO(half)
 INSTANTIATE_CONV_WEIGHT_TO_DHWIO(bfloat)
+
+// DHWIO copy of a transposed-conv weight (C_in, C_out / groups, kD, kH, kW)
+// whose rows are grouped by output phase in the order conv3d_simd<TRANSPOSED>
+// walks them. Each thread streams one kW row.
+template <typename T>
+kernel void conv_transpose_weight_pack(
+    device const T* source [[buffer(0)]],
+    device T* destination [[buffer(1)]],
+    constant ConvTransposeWeightPackParams& params [[buffer(2)]],
+    uint3 position [[thread_position_in_grid]]) {
+  const int output_channel = position.x;
+  const int input_channel = position.y;
+  const int kh = int(position.z) % params.kernel_size[1];
+  const int kd = int(position.z) / params.kernel_size[1];
+  const int group = output_channel / params.output_channels_per_group;
+  device const T* source_row = source +
+      (group * params.input_channels_per_group + input_channel) *
+          params.strides[0] +
+      (output_channel % params.output_channels_per_group) * params.strides[1] +
+      kd * params.strides[2] + kh * params.strides[3];
+  const int2 d = transposed_tap_block(
+      kd % params.tap_step[0], params.kernel_size[0], params.tap_step[0]);
+  const int2 h = transposed_tap_block(
+      kh % params.tap_step[1], params.kernel_size[1], params.tap_step[1]);
+  const int tap_dh = (kd / params.tap_step[0]) * h.x + kh / params.tap_step[1];
+  for (int kw = 0; kw < params.kernel_size[2]; ++kw) {
+    const int2 w = transposed_tap_block(
+        kw % params.tap_step[2], params.kernel_size[2], params.tap_step[2]);
+    const int block = d.y * params.kernel_size[1] * params.kernel_size[2] +
+        d.x * (h.y * params.kernel_size[2] + h.x * w.y);
+    const int tap = block + tap_dh * w.x + kw / params.tap_step[2];
+    destination
+        [(int64_t(tap) * params.input_channels_per_group + input_channel) *
+             params.output_channels +
+         output_channel] = source_row[kw * params.strides[4]];
+  }
+}
+
+#define INSTANTIATE_CONV_TRANSPOSE_WEIGHT_PACK(DT)                      \
+  template [[host_name("conv_transpose_weight_pack_" #DT)]] kernel void \
+  conv_transpose_weight_pack<DT>(                                       \
+      device const DT*,                                                 \
+      device DT*,                                                       \
+      constant ConvTransposeWeightPackParams&,                          \
+      uint3);
+
+INSTANTIATE_CONV_TRANSPOSE_WEIGHT_PACK(float)
+INSTANTIATE_CONV_TRANSPOSE_WEIGHT_PACK(half)
+INSTANTIATE_CONV_TRANSPOSE_WEIGHT_PACK(bfloat)
 
 template <typename T, bool OUT_NLC>
 kernel void conv1d_depthwise(

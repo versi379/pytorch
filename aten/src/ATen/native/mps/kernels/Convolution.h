@@ -35,6 +35,17 @@ struct ConvWeightPermuteParams {
   uint32_t width_stride;
 };
 
+// Transposed-conv weight (C_in, C_out / groups, kD, kH, kW) view to pack;
+// tap_step is stride / gcd(stride, dilation) per spatial dimension.
+struct ConvTransposeWeightPackParams {
+  int32_t output_channels;
+  int32_t output_channels_per_group;
+  int32_t input_channels_per_group;
+  int32_t kernel_size[3];
+  int32_t tap_step[3];
+  int32_t strides[5];
+};
+
 struct Conv2DParams {
   int32_t N;
   int32_t C_in;

@@ -11490,26 +11490,29 @@ class TestConv3dChannelsLast3dMPS(NNTestCase):
         self._run_conv3d_cl3d(input_shape=(2, 4, 8, 8, 8), Cin=4, Cout=4,
                               k=3, pad=1, groups=4, with_bias=True, dtype=torch.float32)
 
-    # ConvTranspose3d routes through _mps_convolution_impl; fp32 only since
-    # the op rejects bf16/fp16 for 3D.
-    def test_conv_transpose3d_channels_last_3d(self):
-        m_cpu = nn.ConvTranspose3d(8, 4, 3, stride=1, padding=1, device="cpu")
-        x_cpu = torch.randn(2, 8, 8, 8, 8, device="cpu", requires_grad=True)
+    # Stride 1 runs as a conv3d with the flipped weight, stride 2 on the transposed kernel.
+    # The fp32 CPU reference gets values already rounded to dtype, so only the MPS rounding is compared.
+    @parametrize("stride", [1, 2])
+    @parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_conv_transpose3d_channels_last_3d(self, stride, dtype):
+        m_cpu = nn.ConvTranspose3d(8, 4, 3, stride=stride, padding=1, device="cpu", dtype=dtype).float()
+        x_cpu = torch.randn(2, 8, 8, 8, 8, device="cpu", dtype=dtype).float().requires_grad_(True)
 
-        m_mps = copy.deepcopy(m_cpu).to("mps")
-        x_mps = (x_cpu.detach().clone().to("mps")
+        m_mps = copy.deepcopy(m_cpu).to(device="mps", dtype=dtype)
+        x_mps = (x_cpu.detach().to(device="mps", dtype=dtype)
                  .contiguous(memory_format=torch.channels_last_3d)
                  .requires_grad_(True))
+        tol = {torch.float32: 1e-4, torch.float16: 1e-2, torch.bfloat16: 5e-2}[dtype]
 
         y_cpu = m_cpu(x_cpu)
         y_mps = m_mps(x_mps)
-        self.assertEqual(y_cpu, y_mps.cpu(), atol=1e-4, rtol=1e-4)
+        self.assertEqual(y_cpu, y_mps.float().cpu(), atol=tol, rtol=tol)
 
-        grad_out = torch.randn_like(y_cpu)
+        grad_out = torch.randn_like(y_cpu).to(dtype).float()
         y_cpu.backward(grad_out)
-        y_mps.backward(grad_out.to("mps"))
-        self.assertEqual(x_cpu.grad, x_mps.grad.cpu(), atol=1e-4, rtol=1e-4)
-        self.assertEqual(m_cpu.weight.grad, m_mps.weight.grad.cpu(), atol=1e-4, rtol=1e-4)
+        y_mps.backward(grad_out.to(device="mps", dtype=dtype))
+        self.assertEqual(x_cpu.grad, x_mps.grad.float().cpu(), atol=tol, rtol=tol)
+        self.assertEqual(m_cpu.weight.grad, m_mps.weight.grad.float().cpu(), atol=tol, rtol=tol)
 
 
 class TestLinalgMPS(TestCaseMPS):
@@ -14819,7 +14822,7 @@ class TestConsistency(TestCaseMPS):
         # MPS uses float32 intermediates for these ops, so the CPU reference
         # must also run in float32 to avoid comparing against less-precise
         # native half-precision CPU results.
-        use_float_ref = op.name in ["grid_sampler_2d", "grid_sampler_3d"] or (
+        use_float_ref = op.name in ["grid_sampler_2d", "grid_sampler_3d", "nn.functional.conv_transpose3d"] or (
             op.name == "nn.functional.pad" and op.variant_test_name in ["reflect", "replicate", "replicate_negative"]
         )
         if use_float_ref and dtype is None and mps_sample.input.dtype in [torch.float16, torch.bfloat16]:
