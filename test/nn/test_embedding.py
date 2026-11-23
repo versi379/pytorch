@@ -3,6 +3,7 @@ import itertools
 import random
 import subprocess
 import sys
+from functools import wraps
 from itertools import product
 
 import torch
@@ -12,12 +13,14 @@ from torch.testing._internal.common_device_type import (
     dtypes,
     dtypesIfCUDA,
     dtypesIfXPU,
+    expectedFailureMPS,
     expectedFailureXLA,
     instantiate_device_type_tests,
     largeTensorTest,
     onlyAccelerator,
     skipCUDAIf,
     skipMeta,
+    skipMPSIf,
     skipXPUIf,
     TEST_WITH_ROCM,
 )
@@ -35,6 +38,20 @@ from torch.testing._internal.common_utils import (
     skipIfTorchDynamo,
     slowTest,
 )
+
+
+def expectedFailureMPSInt32IndicesInt64Offsets(fn):
+    # With int32 indices and int64 offsets, the MPS per_sample_weights backward
+    # kernel is chosen by the int32 indices but reads offset2bag, which the
+    # forward built as int64, as int32, so per_sample_weights.grad is wrong
+    xfail_fn = expectedFailureMPS(fn)
+
+    @wraps(fn)
+    def wrapper(self, device, dtypes):
+        test = xfail_fn if dtypes[:2] == (torch.int, torch.long) else fn
+        return test(self, device, dtypes)
+
+    return wrapper
 
 
 class TestEmbeddingNN(NNTestCase):
@@ -295,6 +312,7 @@ class TestEmbeddingNNDeviceType(NNTestCase):
         self.assertEqual(out.dim(), 2)
         self.assertEqual(out.numel(), 2147483648)
 
+    @skipMPSIf(True, "gradcheck needs float64, which MPS does not support")
     def test_embedding_dense_grad(self, device):
         with set_default_dtype(torch.double):
             embd = nn.Embedding(20, 20).to(device)
@@ -829,6 +847,7 @@ class TestEmbeddingNNDeviceType(NNTestCase):
                 )
 
     @onlyAccelerator
+    @expectedFailureMPS  # https://github.com/pytorch/pytorch/issues/97236
     @dtypes(
         *(
             (torch.float, torch.double, torch.bfloat16, torch.half)
@@ -982,6 +1001,7 @@ class TestEmbeddingNNDeviceType(NNTestCase):
         torch.testing.assert_close(torch.ones(dim, device=device), grad_at_r(dtype))
 
     # https://github.com/pytorch/pytorch/issues/190063
+    @expectedFailureMPS  # https://github.com/pytorch/pytorch/issues/190061
     @dtypes(torch.float32, torch.float64)
     def test_embedding_bag_scale_grad_by_freq_mixed_counts(self, device, dtype):
         # scale_grad_by_freq must divide each index's gradient by that index's
@@ -1171,6 +1191,7 @@ class TestEmbeddingNNDeviceType(NNTestCase):
 
     @skipCUDAIf(True, "no out-of-bounds check on CUDA for perf.")
     @skipXPUIf(True, "no out-of-bounds check on XPU for perf.")
+    @skipMPSIf(True, "out-of-bounds indices are reported asynchronously")
     @dtypes(*itertools.product((torch.float, torch.double), (torch.int, torch.long)))
     @parametrize_test("padding_idx", [None, 0])
     @parametrize_test("mode", ["sum", "mean", "max"])
@@ -1208,8 +1229,8 @@ class TestEmbeddingNNDeviceType(NNTestCase):
         es = nn.EmbeddingBag(5, 2, mode="sum").to(dtype=torch.float, device=device)
         input = torch.tensor([3, 1, 1, 1, 4, 0], dtype=dtypes[0], device=device)
         offsets = torch.tensor([0, 0, 3, 3, 6], dtype=dtypes[1], device=device)
-        per_sample_weights = torch.randn_like(input, dtype=torch.double, device=device)
         if device == "cpu":
+            per_sample_weights = torch.randn_like(input, dtype=torch.double)
             with self.assertRaisesRegex(RuntimeError, "have the same type as"):
                 es(input, offsets, per_sample_weights)
 
@@ -1395,6 +1416,7 @@ class TestEmbeddingNNDeviceType(NNTestCase):
             test_per_sample_weights(mode, trainable)
 
     @skipMeta
+    @expectedFailureMPSInt32IndicesInt64Offsets
     @dtypes(
         *itertools.product(
             (torch.int, torch.long),
@@ -1463,6 +1485,7 @@ class TestEmbeddingNNDeviceType(NNTestCase):
             test_per_sample_weights(mode, trainable)
 
     @skipMeta
+    @expectedFailureMPSInt32IndicesInt64Offsets
     @dtypes(
         *itertools.product(
             (torch.int, torch.long),
@@ -2173,7 +2196,9 @@ torch.cuda.synchronize()
             )
 
 
-instantiate_device_type_tests(TestEmbeddingNNDeviceType, globals(), allow_xpu=True)
+instantiate_device_type_tests(
+    TestEmbeddingNNDeviceType, globals(), allow_xpu=True, allow_mps=True
+)
 instantiate_device_type_tests(TestEmbeddingNNCudaOnly, globals(), only_for="cuda")
 instantiate_parametrized_tests(TestEmbeddingNN)
 
