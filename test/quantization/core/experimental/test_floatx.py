@@ -44,7 +44,7 @@ CUDA_FLOAT8_DTYPES = [
     torch.float8_e8m0fnu,
     torch.float8_e5m3fnu,
 ]
-MPS_FLOAT8_DTYPES = [torch.float8_e4m3fn, torch.float8_e8m0fnu]
+MPS_FLOAT8_DTYPES = [torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e8m0fnu]
 # torch-xpu-ops has no copy kernel for float8_e5m3fnu yet
 XPU_FLOAT8_DTYPES = [d for d in FLOAT8_DTYPES if d is not torch.float8_e5m3fnu]
 

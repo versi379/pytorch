@@ -45,6 +45,32 @@ inline uchar fp8e4m3fn_from_fp32(float value) {
   return result | static_cast<uchar>(sign >> 24);
 }
 
+// float8_e5m2 is the upper byte of a half.
+inline float fp8e5m2_to_fp32(uchar input) {
+  return float(as_type<half>(static_cast<ushort>(ushort(input) << 8)));
+}
+
+inline uchar fp8e5m2_from_fp32(float value) {
+  constexpr uint fp32_inf = 255u << 23;
+  constexpr uint fp8_max = 143u << 23;
+  constexpr uint denorm_mask = 134u << 23;
+  uint bits = as_type<uint>(value);
+  const uint sign = bits & 0x80000000;
+  bits ^= sign;
+  uchar result;
+  if (bits >= fp8_max) {
+    result = bits > fp32_inf ? 0x7f : 0x7c;
+  } else if (bits < (113u << 23)) {
+    bits = as_type<uint>(as_type<float>(bits) + as_type<float>(denorm_mask));
+    result = static_cast<uchar>(bits - denorm_mask);
+  } else {
+    const uint mantissa_odd = (bits >> 21) & 1;
+    bits += ((15u - 127u) << 23) + 0xfffff + mantissa_odd;
+    result = static_cast<uchar>(bits >> 21);
+  }
+  return result | static_cast<uchar>(sign >> 24);
+}
+
 // 0 decodes to 2^-127 and 0xff to NaN; there is no sign, zero or infinity.
 inline float fp8e8m0fnu_to_fp32(uchar input) {
   if (input == 0) {
@@ -82,6 +108,16 @@ struct alignas(1) float8_e4m3fn {
   }
 };
 
+struct alignas(1) float8_e5m2 {
+  uchar x;
+  float8_e5m2() = default;
+  template <typename T>
+  float8_e5m2(T value) : x(detail::fp8e5m2_from_fp32(float(value))) {}
+  operator float() const {
+    return detail::fp8e5m2_to_fp32(x);
+  }
+};
+
 struct alignas(1) float8_e8m0fnu {
   uchar x;
   float8_e8m0fnu() = default;
@@ -94,7 +130,7 @@ struct alignas(1) float8_e8m0fnu {
 
 template <typename T>
 constexpr constant bool is_float8_v = ::metal::is_same_v<T, float8_e4m3fn> ||
-    ::metal::is_same_v<T, float8_e8m0fnu>;
+    ::metal::is_same_v<T, float8_e5m2> || ::metal::is_same_v<T, float8_e8m0fnu>;
 
 } // namespace metal
 } // namespace c10

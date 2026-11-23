@@ -43,6 +43,7 @@
   _(ComplexFloat, 9, float2)           \
   _(Bool, 11, bool)                    \
   _(BFloat16, 15, bfloat)              \
+  _(Float8_e5m2, 23, float8_e5m2)      \
   _(Float8_e4m3fn, 24, float8_e4m3fn)  \
   _(UInt16, 27, uint16_t)              \
   _(UInt32, 28, uint32_t)              \

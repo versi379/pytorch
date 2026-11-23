@@ -7835,7 +7835,7 @@ class TestMPS(TestCaseMPS):
     # Regression test for https://github.com/pytorch/pytorch/issues/197715
     # A dtype-converting copy casts on the GPU straight into the CPU buffer, so a
     # destination dtype Metal cannot represent must raise rather than be left unwritten.
-    @parametrize("dst_dtype", [torch.double, torch.cdouble, torch.float8_e5m2])
+    @parametrize("dst_dtype", [torch.double, torch.cdouble, torch.float8_e5m2fnuz])
     @parametrize("non_blocking", [False, True])
     def test_cast_mps_to_cpu_unsupported_dtype_raises(self, dst_dtype, non_blocking):
         input_cpu = torch.arange(1, 9, dtype=torch.float)

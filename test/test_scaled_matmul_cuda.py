@@ -986,7 +986,7 @@ class TestFP8MatmulDevice(TestCase, _TestFP8MatmulMixin):
         if not PLATFORM_SUPPORTS_FP8:
             raise unittest.SkipTest(f8_msg)
         if "mps" in device and e5m2_type in (x_dtype, y_dtype):
-            raise unittest.SkipTest("MPS has no float8_e5m2")
+            raise unittest.SkipTest("MPS _scaled_mm takes float8_e4m3fn only")
         x_fp8 = torch.rand(size, size, device=device).to(x_dtype)
         y_fp8 = torch.eye(size, device=device, dtype=y_dtype)
         if not x_cm:
@@ -1019,7 +1019,7 @@ class TestFP8MatmulDevice(TestCase, _TestFP8MatmulMixin):
         ],
         name_fn=lambda test_case: test_case[0],
     )
-    @decorateIf(unittest.skip("MPS has no float8_e5m2"),
+    @decorateIf(unittest.skip("MPS _scaled_mm takes float8_e4m3fn only"),
                 lambda p: "mps" in p["device"] and e5m2_type in p["test_case"][1:3])
     def test_float8_basics(self, device, test_case) -> None:
         _, x_dtype, y_dtype, out_dtype, size = test_case
@@ -1079,7 +1079,7 @@ class TestFP8MatmulDevice(TestCase, _TestFP8MatmulMixin):
     def test_float8_scale(self, device) -> None:
         size = (16, 16)
         x = torch.full(size, .5, device=device, dtype=e4m3_type)
-        # hipblaslt does not yet support mixed e4m3_type input; MPS has no e5m2
+        # hipblaslt does not yet support mixed e4m3_type input; MPS _scaled_mm takes e4m3 only
         y_type = e4m3_type if torch.version.hip or "mps" in device else e5m2_type
         y = torch.full(size, .5, device=device, dtype=y_type).t()
         scale_one = torch.tensor(1.0, device=device)
@@ -1966,7 +1966,7 @@ class TestFP8MatmulDevice(TestCase, _TestFP8MatmulMixin):
     def test_float8_scale_fast_accum(self, device) -> None:
         size = (16, 16)
         x = torch.full(size, .5, device=device, dtype=e4m3_type)
-        # hipblaslt does not yet support mixed e4m3_type input; MPS has no e5m2
+        # hipblaslt does not yet support mixed e4m3_type input; MPS _scaled_mm takes e4m3 only
         y_type = e4m3_type if torch.version.hip or "mps" in device else e5m2_type
         y = torch.full(size, .5, device=device, dtype=y_type).t()
         scale_a = torch.tensor(1.5, device=device)
@@ -2089,8 +2089,8 @@ class TestFP8MatmulDevice(TestCase, _TestFP8MatmulMixin):
         is_xpu_device = "xpu" in device
 
         if "mps" in device:
-            # MPS has no float8_e5m2 dtype
-            with self.assertRaisesRegex(RuntimeError, "Undefined type Float8_e5m2"):
+            # MPS _scaled_mm takes float8_e4m3fn only
+            with self.assertRaisesRegex(TypeError, "Expected mat_b to be Float8_e4m3fn"):
                 e5m2()
         elif is_xpu_device or not is_cuda_device:
             out = e5m2()
