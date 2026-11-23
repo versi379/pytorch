@@ -734,13 +734,13 @@ void MPSProfiler::emitSignpostEvent(SignpostTypes signpost_type,
   // need to use switch-case as the signpost names must be literal strings
   switch (signpost_type) {
     case SignpostTypes::RUN_OPERATION:
-      os_signpost_event_emit(m_os_log_events, signpost_id, kEvtSignpostRunOperationStr, "%s", msg);
+      os_signpost_event_emit(m_os_log_events, signpost_id, kEvtSignpostRunOperationStr, "%{public}s", msg);
       break;
     case SignpostTypes::BLIT_COPY:
-      os_signpost_event_emit(m_os_log_events, signpost_id, kEvtSignpostBlitCopyStr, "%s", msg);
+      os_signpost_event_emit(m_os_log_events, signpost_id, kEvtSignpostBlitCopyStr, "%{public}s", msg);
       break;
     case SignpostTypes::CPU_FALLBACK:
-      os_signpost_event_emit(m_os_log_events, signpost_id, kEvtSignpostCPUFallbacksStr, "%s", msg);
+      os_signpost_event_emit(m_os_log_events, signpost_id, kEvtSignpostCPUFallbacksStr, "%{public}s", msg);
       break;
     default:
       TORCH_CHECK(false, "unknown SignpostType in MPS profiler");
@@ -758,13 +758,13 @@ void MPSProfiler::beginSignpostInterval(SignpostTypes signpost_type,
 
   switch (signpost_type) {
     case SignpostTypes::RUN_OPERATION:
-      os_signpost_interval_begin(m_os_log_intervals, signpost_id, kIntSignpostRunOperationStr, "%s", msg);
+      os_signpost_interval_begin(m_os_log_intervals, signpost_id, kIntSignpostRunOperationStr, "%{public}s", msg);
       break;
     case SignpostTypes::BLIT_COPY:
-      os_signpost_interval_begin(m_os_log_intervals, signpost_id, kIntSignpostBlitCopyStr, "%s", msg);
+      os_signpost_interval_begin(m_os_log_intervals, signpost_id, kIntSignpostBlitCopyStr, "%{public}s", msg);
       break;
     case SignpostTypes::CPU_FALLBACK:
-      os_signpost_interval_begin(m_os_log_intervals, signpost_id, kIntSignpostCPUFallbacksStr, "%s", msg);
+      os_signpost_interval_begin(m_os_log_intervals, signpost_id, kIntSignpostCPUFallbacksStr, "%{public}s", msg);
       break;
     default:
       TORCH_CHECK(false, "unknown SignpostType in MPS profiler");
