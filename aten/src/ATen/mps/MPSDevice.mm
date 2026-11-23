@@ -19,6 +19,12 @@ MPSDevice::~MPSDevice() {
 }
 
 MPSDevice::MPSDevice() : _mtl_device(nil) {
+  // MPS requires macOS 15.0+. A nil device makes is_available() return false and allocations raise
+  // MPS_ERROR_RUNTIME_TOO_LOW, instead of aborting later on a selector macOS 14 lacks.
+  // is_macos_at_least() goes through getInstance() and would re-enter this constructor.
+  if (!isMacOS13Plus(MacOSVersion::MACOS_15_0)) {
+    return;
+  }
   NSArray* devices = [MTLCopyAllDevices() autorelease];
   if ([devices count] > 0) {
     _mtl_device = [devices[0] retain];
