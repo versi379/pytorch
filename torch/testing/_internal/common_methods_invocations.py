@@ -4239,7 +4239,9 @@ def sample_inputs_conv_transpose3d(op_info, device, dtype, requires_grad, **kwar
         ((1, 1, 4, 3, 4), (1, 2, 3, 4, 5), None,
          {'stride': 2, 'padding': 1, 'output_padding': 1, 'groups': 1}),
         ((1, 4, 5, 5, 5), (4, 8, 3, 3, 3), None,
-         {})
+         {}),
+        ((2, 4, 3, 4, 5), (4, 6, 1, 2, 3), (6,),
+         {'stride': (1, 2, 3)})
     )
 
     for input_shape, weight, bias, kwargs in cases:

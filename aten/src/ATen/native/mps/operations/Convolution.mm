@@ -1538,6 +1538,58 @@ static Tensor mps_convolution_transpose_forward(const Tensor& grad_output,
       input_size, grad_output, weight, padding, stride, dilation, groups, false, output_memory_format);
 }
 
+// With stride == kernel size and no padding each input voxel fills its own output block, so the transposed conv
+// is one GEMM over input channels followed by a depth-to-space copy.
+static bool conv_transpose3d_is_depth_to_space(const Tensor& weight,
+                                               IntArrayRef padding,
+                                               IntArrayRef output_padding,
+                                               IntArrayRef stride,
+                                               IntArrayRef dilation,
+                                               int64_t groups) {
+  if (groups != 1) {
+    return false;
+  }
+  for (const auto i : c10::irange(3)) {
+    if (stride[i] != weight.size(i + 2) || padding[i] != 0 || output_padding[i] != 0 || dilation[i] != 1) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void conv_transpose3d_depth_to_space(const Tensor& input,
+                                            const Tensor& weight,
+                                            const Tensor& output,
+                                            MemoryFormat memory_format) {
+  const auto batch = input.size(0);
+  const auto input_channels = input.size(1);
+  const auto depth = input.size(2);
+  const auto height = input.size(3);
+  const auto width = input.size(4);
+  const auto output_channels = weight.size(1);
+  const auto kernel_depth = weight.size(2);
+  const auto kernel_height = weight.size(3);
+  const auto kernel_width = weight.size(4);
+  const auto weight_matrix =
+      weight.reshape({input_channels, output_channels * kernel_depth * kernel_height * kernel_width});
+  if (memory_format == MemoryFormat::ChannelsLast3d) {
+    // (N * D * H * W, C_in) x (C_in, C_out * kD * kH * kW): rows of the output with C_out innermost.
+    const auto columns =
+        at::mm(input.permute({0, 2, 3, 4, 1}).reshape({batch * depth * height * width, input_channels}), weight_matrix);
+    output.permute({0, 2, 3, 4, 1})
+        .view({batch, depth, kernel_depth, height, kernel_height, width, kernel_width, output_channels})
+        .copy_(columns.view({batch, depth, height, width, output_channels, kernel_depth, kernel_height, kernel_width})
+                   .permute({0, 1, 5, 2, 6, 3, 7, 4}));
+  } else {
+    // (C_out * kD * kH * kW, C_in) x (C_in, N * D * H * W); the input transpose is a view at batch 1.
+    const auto columns =
+        at::mm(weight_matrix.t(), input.transpose(0, 1).reshape({input_channels, batch * depth * height * width}));
+    output.view({batch, output_channels, depth, kernel_depth, height, kernel_height, width, kernel_width})
+        .copy_(columns.view({output_channels, kernel_depth, kernel_height, kernel_width, batch, depth, height, width})
+                   .permute({4, 0, 5, 1, 6, 2, 7, 3}));
+  }
+}
+
 static Tensor conv_transpose3d_metal(const Tensor& input_t,
                                      const Tensor& weight_t,
                                      IntArrayRef padding,
@@ -1550,10 +1602,11 @@ static Tensor conv_transpose3d_metal(const Tensor& input_t,
   TensorArg input{input_t, "input", 1}, weight{weight_t, "weight", 2};
   checkAllSameType(c, {input, weight});
   checkAllSameGPU(c, {input, weight});
+  const auto memory_format = conv_backward_memory_format(input_t, weight_t);
   auto output_t =
       at::empty(conv_input_size(input_t.sizes(), weight_t.sizes(), padding, output_padding, stride, dilation, groups),
                 input_t.options(),
-                conv_backward_memory_format(input_t, weight_t));
+                memory_format);
   TensorArg output{output_t, "result", 0};
   convolution_shape_check(c, output, weight, input, padding, stride, dilation, groups);
   if (output_t.numel() == 0) {
@@ -1571,6 +1624,10 @@ static Tensor conv_transpose3d_metal(const Tensor& input_t,
         weight_t.unflatten(0, {groups, weight_t.size(0) / groups}).transpose(1, 2).flatten(0, 1).flip({2, 3, 4});
     return _mps_convolution_impl(
         input_t, conv_weight, std::nullopt, conv_padding, stride, dilation, groups, std::nullopt, output_t);
+  }
+  if (conv_transpose3d_is_depth_to_space(weight_t, padding, output_padding, stride, dilation, groups)) {
+    conv_transpose3d_depth_to_space(input_t, weight_t, output_t, memory_format);
+    return output_t;
   }
   conv3d_metal_forward(
       input_t, weight_t, std::nullopt, padding, stride, dilation, groups, output_t, /*transposed=*/true);
